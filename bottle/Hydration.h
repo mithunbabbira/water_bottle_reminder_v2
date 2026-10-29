@@ -24,15 +24,17 @@ class Hydration {
     nvm.clearBaseline();
     drinkAlert_ = false;
     resumeAlert_ = false;
+    drinkFlashUntil_ = 0;
   }
 
   void tick(uint32_t now, Scale &scale, BottleNvm &nvm, Outputs &out, const Clock &clock, const AtHome &atHome) {
     rollDay(clock, nvm);
     const bool away = atHome.watching && atHome.decided && !atHome.home;
-    if (away && (drinkAlert_ || missingAlert_ || resumeAlert_)) {
+    // A lift keeps resumeAlert_ even if presence flaps while the bottle is in hand.
+    // Away only silences an alert that is actually running.
+    if (away && (drinkAlert_ || missingAlert_)) {
       drinkAlert_ = false;
       missingAlert_ = false;
-      resumeAlert_ = false;
       Serial.println("you left, reminder off");
     }
     if (away && missing_) {
@@ -62,11 +64,11 @@ class Hydration {
       if (now - stabilizeMs_ >= STABILIZE_MS) {
         stabilizing_ = false;
         const WeighResult result = weigh(scale, nvm);
-        if (result == WeighResult::NoChange && resumeAlert_ && !quiet && phoneAllows(atHome)) {
-          startAlert(now);
-        }
-        resumeAlert_ = false;
+        settleReturn(now, result, quiet, atHome);
       }
+    } else if (resumeAlert_ && !missing_ && !drinkAlert_ && !quiet && (int32_t)(now - nextCheckMs_) >= 0) {
+      const WeighResult result = weigh(scale, nvm);
+      settleReturn(now, result, quiet, atHome);
     } else if (!missing_ && !drinkAlert_ && !quiet && (int32_t)(now - nextCheckMs_) >= 0) {
       const WeighResult result = weigh(scale, nvm);
       if (result == WeighResult::NoChange) {
@@ -94,6 +96,31 @@ class Hydration {
   float lastDrinkMl() const { return lastDrinkMl_; }
   void setPump(void (*pump)()) { pump_ = pump; }
 
+  void clearToday(BottleNvm &nvm) {
+    dailyMl_ = 0.0f;
+    lastDrinkMl_ = 0.0f;
+    hasLastDrink_ = false;
+    nvm.saveTotals(dailyMl_, lastDay_);
+  }
+
+  // Seconds override lasts until reboot. Zero uses the saved minute interval.
+  void setCheckSeconds(uint16_t seconds, const BottleNvm &nvm) {
+    testIntervalSec_ = seconds;
+    if (bootReady_ && hasBaseline_ && !missing_ && !stabilizing_ && !drinkAlert_) {
+      nextCheckMs_ = millis() + intervalMs(nvm);
+    }
+    if (seconds == 0) {
+      Serial.print("check every ");
+      Serial.print(nvm.data.intervalMin == 0 ? 30 : nvm.data.intervalMin);
+      Serial.println(" min");
+    } else {
+      Serial.print("check every ");
+      Serial.print(seconds);
+      Serial.println(" s");
+    }
+    Serial.println("drink stops at 50 g, refill at 100 g, bottle off under 100 g");
+  }
+
  private:
   bool hasBaseline_ = false;
   float baseline_ = 0.0f;
@@ -119,6 +146,8 @@ class Hydration {
   uint32_t blinkMs_ = 0;
   uint32_t nextCheckMs_ = 0;
   uint32_t warmupUntil_ = 0;
+  uint32_t drinkFlashUntil_ = 0;
+  uint16_t testIntervalSec_ = 0;
   void (*pump_)() = nullptr;
 
   void pause(uint32_t ms) {
@@ -215,6 +244,7 @@ class Hydration {
       resumeAlert_ = true;
       drinkAlert_ = false;
     }
+    drinkFlashUntil_ = 0;
     Serial.println("bottle lifted");
   }
 
@@ -227,6 +257,28 @@ class Hydration {
     presentCount_ = 0;
     bootReady_ = true;
     Serial.println("bottle returned");
+  }
+
+  // After a put-down, weigh once. A real drink or refill ends the reminder.
+  // No change resumes it when the phone is here, and retries soon if the ping
+  // missed at that moment. The resume flag survives an away reading while lifted.
+  void settleReturn(uint32_t now, WeighResult result, bool quiet, const AtHome &atHome) {
+    if (result == WeighResult::Drink || result == WeighResult::Refill || result == WeighResult::NewBaseline) {
+      resumeAlert_ = false;
+      return;
+    }
+    if (!resumeAlert_ || result != WeighResult::NoChange) {
+      return;
+    }
+    if (!quiet && phoneAllows(atHome)) {
+      startAlert(now);
+      resumeAlert_ = false;
+      Serial.println("reminder resumed");
+      return;
+    }
+    if (!quiet) {
+      nextCheckMs_ = now + 1000;
+    }
   }
 
   WeighResult weigh(Scale &scale, BottleNvm &nvm) {
@@ -265,6 +317,7 @@ class Hydration {
       drinkAlert_ = false;
       resumeAlert_ = false;
       nextCheckMs_ = millis() + intervalMs(nvm);
+      drinkFlashUntil_ = millis() + DRINK_FLASH_MS;
       Serial.print("drink ");
       Serial.print(diff, 1);
       Serial.print(" ml, today ");
@@ -351,6 +404,11 @@ class Hydration {
       return;
     }
 
+    if (!missing_ && (int32_t)(drinkFlashUntil_ - now) > 0) {
+      out.show(DRINK_OK_R, DRINK_OK_G, DRINK_OK_B, false, false, nvm.data.beepType);
+      return;
+    }
+
     if (stabilizing_) {
       out.show(quiet ? QUIET_R : nvm.data.colorR, quiet ? QUIET_G : nvm.data.colorG,
                quiet ? QUIET_B : nvm.data.colorB, false, false, nvm.data.beepType);
@@ -387,7 +445,10 @@ class Hydration {
     return atHome.decided && atHome.home;
   }
 
-  static uint32_t intervalMs(const BottleNvm &nvm) {
+  uint32_t intervalMs(const BottleNvm &nvm) const {
+    if (testIntervalSec_ > 0) {
+      return (uint32_t)testIntervalSec_ * 1000UL;
+    }
     const uint16_t minutes = nvm.data.intervalMin == 0 ? 30 : nvm.data.intervalMin;
     return (uint32_t)minutes * 60000UL;
   }

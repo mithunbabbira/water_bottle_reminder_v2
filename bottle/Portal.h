@@ -2,7 +2,7 @@
 
 #include "Hydration.h"
 #include "Scale.h"
-#include "WebPage.h"
+#include "WebPageGz.h"
 
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -86,6 +86,10 @@ class Portal {
     if (apOn_) {
       dns_.processNextRequest();
     }
+    if (restartAtMs_ != 0 && (int32_t)(millis() - restartAtMs_) >= 0) {
+      restartAtMs_ = 0;
+      restartRadio();
+    }
     const bool connected = WiFi.status() == WL_CONNECTED;
     if (connected && !clockStarted_) {
       announceLan();
@@ -123,7 +127,7 @@ class Portal {
   }
 
   void printStatus() {
-    char body[768];
+    char body[896];
     writeStatus(body, sizeof(body));
     Serial.println(body);
   }
@@ -145,6 +149,7 @@ class Portal {
   uint32_t staStartedMs_ = 0;
   uint32_t apCloseMs_ = 0;
   uint32_t lastApLogMs_ = 0;
+  uint32_t restartAtMs_ = 0;
 
   int pickSavedNet() {
     if (nvm_->data.netCount == 0) {
@@ -183,8 +188,8 @@ class Portal {
     if (MDNS.begin("bottle")) {
       MDNS.addService("http", "tcp", 80);
     }
-    configTime(19800, 0, "pool.ntp.org", "time.google.com");
     clockStarted_ = true;
+    applyClock();
     Serial.print("wifi ");
     Serial.print(WiFi.SSID());
     Serial.print(" ");
@@ -253,6 +258,11 @@ class Portal {
     apOn_ = false;
   }
 
+  void applyClock() {
+    configTime((long)nvm_->data.tzMin * 60L, 0, "pool.ntp.org", "time.google.com");
+    readClock();
+  }
+
   void readClock() {
     struct tm local;
     if (!getLocalTime(&local, 0)) {
@@ -317,13 +327,14 @@ class Portal {
 
     const IPAddress ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP();
     snprintf(out, outLen,
-             "{\"grams\":%s,\"missing\":%s,\"today\":%.1f,\"last\":%s,\"watching\":%s,\"home\":%s,"
-             "\"dnd\":%s,\"r\":%u,\"g\":%u,\"b\":%u,\"start\":%u,\"end\":%u,\"interval\":%u,\"beep\":%u,\"ap\":%u,"
+             "{\"grams\":%s,\"fault\":%s,\"missing\":%s,\"today\":%.1f,\"last\":%s,\"watching\":%s,\"home\":%s,"
+             "\"dnd\":%s,\"r\":%u,\"g\":%u,\"b\":%u,\"start\":%u,\"end\":%u,\"interval\":%u,\"beep\":%u,\"ap\":%u,\"tz\":%d,"
              "\"mac\":\"%s\",\"ssid\":\"%s\",\"nets\":%s,\"wifi\":%s,\"ip\":\"%u.%u.%u.%u\"}",
-             gramText, isMissing ? "true" : "false", todayMl, lastText,
+             gramText, scale_->fault() ? "true" : "false", isMissing ? "true" : "false", todayMl, lastText,
              home.watching ? "true" : "false", home.home ? "true" : "false",
              nvm_->data.dnd ? "true" : "false", nvm_->data.colorR, nvm_->data.colorG, nvm_->data.colorB,
              nvm_->data.startMin, nvm_->data.endMin, nvm_->data.intervalMin, nvm_->data.beepType, nvm_->data.apBehavior,
+             nvm_->data.tzMin,
              macText(), ssid, netsJson, WiFi.status() == WL_CONNECTED ? "true" : "false", ip[0], ip[1], ip[2], ip[3]);
   }
 
@@ -335,7 +346,8 @@ class Portal {
 
   void sendPage() {
     armReply();
-    server_.send_P(200, "text/html", BOTTLE_PAGE);
+    server_.sendHeader("Content-Encoding", "gzip");
+    server_.send_P(200, "text/html", (PGM_P)BOTTLE_PAGE_GZ, BOTTLE_PAGE_GZ_LEN);
   }
 
   void sendPhones() {
@@ -396,7 +408,7 @@ class Portal {
     armReply();
     server_.send(200, "text/plain", "ok");
     if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
-      restartRadio();
+      restartAtMs_ = millis() + 500;
     }
   }
 
@@ -448,6 +460,13 @@ class Portal {
       nvm_->saveWindow((uint16_t)(sh * 60 + sm), (uint16_t)(eh * 60 + em));
     }
 
+    if (server_.hasArg("tz")) {
+      const int tz = server_.arg("tz").toInt();
+      if (tz != nvm_->data.tzMin && nvm_->saveTz((int16_t)tz)) {
+        applyClock();
+      }
+    }
+
     const int minutes = server_.arg("interval").toInt();
     if (minutes >= 1 && minutes <= 240) {
       nvm_->saveInterval((uint16_t)minutes);
@@ -481,16 +500,21 @@ class Portal {
       nvm_->saveAp(data.apSsid, data.apPass, (uint8_t)behavior);
     }
 
-    server_.sendHeader("Connection", "close");
-    server_.sendHeader("Location", "/", true);
-    server_.send(302, "text/plain", "");
+    if (server_.hasArg("js")) {
+      armReply();
+      server_.send(200, "text/plain", "ok");
+    } else {
+      server_.sendHeader("Connection", "close");
+      server_.sendHeader("Location", "/", true);
+      server_.send(302, "text/plain", "");
+    }
     if (wifiChanged) {
-      restartRadio();
+      restartAtMs_ = millis() + 500;
     }
   }
 
   void sendStatus() {
-    char body[768];
+    char body[896];
     writeStatus(body, sizeof(body));
     armReply();
     server_.send(200, "application/json", body);

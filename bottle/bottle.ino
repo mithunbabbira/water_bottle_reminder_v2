@@ -6,6 +6,7 @@
 // Boot prints weight, zero, calibration, phone, Wi-Fi, time, and the from–until window.
 // It does not write a new zero, open a setup network, or start reminders.
 
+#include "PhonePresence.h"
 #include "Portal.h"
 #include "Scale.h"
 
@@ -42,6 +43,8 @@ Heard heard[8];
 int heardCount = 0;
 
 bool pairing = false;
+uint32_t pairingMs = 0;
+static const uint32_t PAIRING_WINDOW_MS = 120000;
 bool serverReady = false;
 
 struct PairResult {
@@ -57,10 +60,12 @@ PairResult pairResult;
 volatile bool pairReady = false;
 volatile bool phoneConnected = false;
 volatile unsigned dropCount = 0;
-uint32_t phoneSeenMs = 0;
-bool phoneEverSeen = false;
+volatile uint32_t phoneSeenMs = 0;
+volatile bool phoneEverSeen = false;
 
 static const uint32_t WEIGHT_WAIT_MS = 2000;
+
+PhonePresence presence;
 
 bool parseMac(const char *text, uint8_t out[6]) {
   unsigned int b[6];
@@ -273,12 +278,28 @@ AtHome currentAtHome() {
     home.home = true;
     return home;
   }
-  const bool connected = phoneIsConnected();
-  const bool recentlySeen = phoneEverSeen && (millis() - phoneSeenMs < 90000);
-  home.watching = phoneEverSeen || connected;
+  presence.suspend(pairing);
+  presence.tick(phoneIsConnected());
+  home.watching = true;
   home.decided = true;
-  home.home = connected || recentlySeen;
+  home.home = presence.here();
   return home;
+}
+
+void reportPresence(const AtHome &home) {
+  static int last = -1;
+  const int state = !home.watching ? 0 : (home.home ? 1 : 2);
+  if (state == last) {
+    return;
+  }
+  last = state;
+  if (state == 0) {
+    Serial.println("presence: not watching, reminders allowed");
+  } else if (state == 1) {
+    Serial.println("presence: phone here, reminders allowed");
+  } else {
+    Serial.println("presence: phone away, reminders off");
+  }
 }
 
 void finishPair() {
@@ -300,6 +321,7 @@ void finishPair() {
     BLEDevice::getAdvertising()->stop();
   }
   pairing = false;
+  presence.setAddress(pairResult.mac);
   if (pairResult.sameSaved) {
     Serial.println("phone connected");
     return;
@@ -358,10 +380,62 @@ void startBleServer(bool announce) {
     Serial.println("pair advertise failed");
     return;
   }
-  pairing = true;
+  if (announce) {
+    pairing = true;
+    pairingMs = millis();
+  }
 }
 
 void startPairing() { startBleServer(true); }
+
+void bindPresence() {
+  if (!nvm.data.hasIrk && !nvm.data.hasBleMac) {
+    return;
+  }
+  if (!BLEDevice::getInitialized() && !ensureBle()) {
+    return;
+  }
+  uint8_t mac[6];
+  bool found = false;
+  ble_addr_t peers[3];
+  int count = 0;
+  if (ble_store_util_bonded_peers(peers, &count, 3) == 0) {
+    int chosen = -1;
+    for (int i = 0; i < count; i++) {
+      struct ble_store_key_sec key;
+      struct ble_store_value_sec value;
+      memset(&key, 0, sizeof(key));
+      key.peer_addr = peers[i];
+      if (ble_store_read_peer_sec(&key, &value) != 0 || !value.irk_present || !nvm.data.hasIrk) {
+        continue;
+      }
+      if (memcmp(value.irk, nvm.data.irk, 16) == 0) {
+        chosen = i;
+        break;
+      }
+    }
+    if (chosen < 0 && count > 0) {
+      chosen = 0;
+    }
+    if (chosen >= 0) {
+      for (int i = 0; i < 6; i++) {
+        mac[i] = peers[chosen].val[5 - i];
+      }
+      found = true;
+    }
+  }
+  if (!found && nvm.data.hasBleMac) {
+    memcpy(mac, nvm.data.bleMac, 6);
+    found = true;
+  }
+  if (!found) {
+    return;
+  }
+  presence.setAddress(mac);
+  Serial.print("presence ping ");
+  printMac(mac);
+  Serial.println();
+}
 
 bool printableName(const char *text) {
   if (text == nullptr || text[0] == '\0') {
@@ -437,6 +511,7 @@ void searchPhones(const char *query) {
     heardCount = 0;
     return;
   }
+  presence.suspend(true);
   const bool resumeAdvert = BLEDevice::getAdvertising()->isAdvertising();
   if (resumeAdvert) {
     BLEDevice::getAdvertising()->stop();
@@ -494,6 +569,7 @@ void searchPhones(const char *query) {
   if (resumeAdvert && !phoneIsConnected()) {
     BLEDevice::getAdvertising()->start();
   }
+  presence.suspend(false);
   Serial.print("heard ");
   Serial.print(found);
   Serial.println(" devices");
@@ -566,6 +642,8 @@ void printHelp() {
   Serial.println("n scan 2.4 GHz Wi-Fi, j <ssid>|<pass> save Wi-Fi and join");
   Serial.println("r <ssid> forgets one saved Wi-Fi");
   Serial.println("a page status, w print weight, h help");
+  Serial.println("i <seconds> reminder check until reboot, i 0 uses saved minutes");
+  Serial.println("d clears today's total");
 }
 
 void handleLine() {
@@ -637,6 +715,11 @@ void handleLine() {
         Serial.println("wifi save failed (ssid <= 32, pass 8-63 or empty)");
       }
     }
+  } else if (cmd == 'd' || cmd == 'D') {
+    hydration.clearToday(nvm);
+    Serial.println("today cleared");
+  } else if (cmd == 'i' || cmd == 'I') {
+    hydration.setCheckSeconds((uint16_t)atoi(line + 1), nvm);
   } else if (cmd == 'w' || cmd == 'W') {
     lastPrintMs = 0;
   } else {
@@ -670,7 +753,13 @@ bool waitForRaw() {
 }
 
 void printChecks(bool haveWeight) {
-  Serial.println(haveWeight ? "weight: ok" : "weight: no data");
+  if (!haveWeight) {
+    Serial.println("weight: no data");
+  } else if (scale.fault()) {
+    Serial.println("weight: stuck at full scale, check load cell wires");
+  } else {
+    Serial.println("weight: ok");
+  }
   Serial.println(nvm.data.hasTare ? "zero: ok" : "zero: not zeroed");
   Serial.println(nvm.data.hasCal ? "cal: ok" : "cal: not calibrated");
   if (nvm.data.hasIrk) {
@@ -733,7 +822,9 @@ void printSample(uint32_t now) {
   Serial.print("raw ");
   Serial.print(raw);
   float grams = 0.0f;
-  if (scale.latestGrams(&grams, 1000)) {
+  if (scale.fault()) {
+    Serial.println("  scale fault: check load cell wires");
+  } else if (scale.latestGrams(&grams, 1000)) {
     Serial.print("  g ");
     Serial.println(grams, 1);
   } else {
@@ -776,6 +867,7 @@ void setup() {
   if (nvm.data.hasIrk) {
     startBleServer(false);
   }
+  bindPresence();
   printHelp();
 }
 
@@ -786,6 +878,11 @@ void loop() {
   reportDrops();
   finishPair();
   scale.poll(nvm.data);
-  hydration.tick(millis(), scale, nvm, outputs, wallClock, currentAtHome());
+  if (pairing && millis() - pairingMs > PAIRING_WINDOW_MS) {
+    pairing = false;
+  }
+  const AtHome home = currentAtHome();
+  reportPresence(home);
+  hydration.tick(millis(), scale, nvm, outputs, wallClock, home);
   printSample(millis());
 }

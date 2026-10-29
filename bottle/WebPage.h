@@ -41,6 +41,45 @@ static const char BOTTLE_PAGE[] PROGMEM = R"html(<!DOCTYPE html>
   <form id="settings" method="post" action="/settings">
     <label class="check"><input id="dnd" name="dnd" type="checkbox"> Do not disturb</label>
     <label>Light color <input id="color" name="color" type="color"></label>
+    <label>Time zone
+      <select id="tz" name="tz">
+        <option value="-720">Baker Island (UTC-12)</option>
+        <option value="-660">Pago Pago (UTC-11)</option>
+        <option value="-600">Honolulu (UTC-10)</option>
+        <option value="-540">Anchorage (UTC-9)</option>
+        <option value="-480">Los Angeles (UTC-8)</option>
+        <option value="-420">Denver (UTC-7)</option>
+        <option value="-360">Chicago (UTC-6)</option>
+        <option value="-300">New York (UTC-5)</option>
+        <option value="-240">Halifax (UTC-4)</option>
+        <option value="-210">St. John's (UTC-3:30)</option>
+        <option value="-180">Sao Paulo (UTC-3)</option>
+        <option value="-120">Noronha (UTC-2)</option>
+        <option value="-60">Azores (UTC-1)</option>
+        <option value="0">London (UTC+0)</option>
+        <option value="60">Paris (UTC+1)</option>
+        <option value="120">Cairo (UTC+2)</option>
+        <option value="180">Moscow (UTC+3)</option>
+        <option value="210">Tehran (UTC+3:30)</option>
+        <option value="240">Dubai (UTC+4)</option>
+        <option value="270">Kabul (UTC+4:30)</option>
+        <option value="300">Karachi (UTC+5)</option>
+        <option value="330">Kolkata (UTC+5:30)</option>
+        <option value="345">Kathmandu (UTC+5:45)</option>
+        <option value="360">Dhaka (UTC+6)</option>
+        <option value="390">Yangon (UTC+6:30)</option>
+        <option value="420">Bangkok (UTC+7)</option>
+        <option value="480">Singapore (UTC+8)</option>
+        <option value="540">Tokyo (UTC+9)</option>
+        <option value="570">Adelaide (UTC+9:30)</option>
+        <option value="600">Sydney (UTC+10)</option>
+        <option value="660">Noumea (UTC+11)</option>
+        <option value="720">Auckland (UTC+12)</option>
+        <option value="765">Chatham Islands (UTC+12:45)</option>
+        <option value="780">Nuku'alofa (UTC+13)</option>
+        <option value="840">Kiritimati (UTC+14)</option>
+      </select>
+    </label>
     <label>Quiet from <input id="start" name="start" type="time"></label>
     <label>Quiet until <input id="end" name="end" type="time"></label>
     <label>Check every <input id="interval" name="interval" type="number" min="1" max="240"> minutes</label>
@@ -70,6 +109,7 @@ static const char BOTTLE_PAGE[] PROGMEM = R"html(<!DOCTYPE html>
       </select>
     </label>
     <button type="submit">Save</button>
+    <p class="muted" id="saved"></p>
   </form>
 </main>
 <script>
@@ -77,6 +117,21 @@ function hm(m){const h=Math.floor(m/60), n=m%60; return String(h).padStart(2,"0"
 function hex(r,g,b){return "#"+[r,g,b].map(v=>Number(v).toString(16).padStart(2,"0")).join("");}
 let formReady = false;
 let refreshing = false;
+let misses = 0;
+async function get(url, opts, ms){
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms || 4000);
+  try {
+    const r = await fetch(url, Object.assign({cache:"no-store", signal:ctl.signal}, opts || {}));
+    if (!r.ok) throw new Error(String(r.status));
+    return r;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function post(url, body, ms){
+  return get(url, {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:body || ""}, ms);
+}
 function renderSavedWifis(nets, activeSsid, connected){
   const label = document.getElementById("wifi-saved-label");
   const box = document.getElementById("saved-wifis");
@@ -97,9 +152,13 @@ function renderSavedWifis(nets, activeSsid, connected){
     del.type = "button";
     del.textContent = "Remove";
     del.onclick = async () => {
-      await fetch("/wifi/remove", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"ssid="+encodeURIComponent(name)});
-      formReady = false;
-      refresh();
+      try {
+        await post("/wifi/remove", "ssid="+encodeURIComponent(name));
+        formReady = false;
+        refresh();
+      } catch (e) {
+        label.textContent = "Remove did not reach the bottle. Try again.";
+      }
     };
     row.appendChild(span);
     row.appendChild(del);
@@ -110,11 +169,10 @@ async function refresh(){
   if (refreshing) return Promise.resolve();
   refreshing = true;
   try {
-    const response = await fetch("/api", {cache:"no-store"});
-    if (!response.ok) throw new Error(String(response.status));
-    const s = await response.json();
+    const s = await (await get("/api", null, 3000)).json();
+    misses = 0;
     document.getElementById("grams").textContent = s.grams == null ? "--" : s.grams;
-    document.getElementById("place").textContent = s.grams == null ? "No weight reading." : (s.missing ? "Bottle is off the base." : "Bottle is on the base.");
+    document.getElementById("place").textContent = s.fault ? "Scale fault: check the load cell wires to the HX711." : (s.grams == null ? "No weight reading." : (s.missing ? "Bottle is off the base." : "Bottle is on the base."));
     document.getElementById("today").textContent = s.today;
     document.getElementById("last").textContent = s.last == null ? "none yet" : (s.last + " ml");
     document.getElementById("phone-now").textContent = s.mac ? ("Saved phone " + s.mac) : "No phone saved yet.";
@@ -128,6 +186,8 @@ async function refresh(){
       document.getElementById("start").value = hm(s.start);
       document.getElementById("end").value = hm(s.end);
       document.getElementById("interval").value = s.interval;
+      const tz = document.getElementById("tz");
+      if ([...tz.options].some(o => o.value === String(s.tz))) tz.value = String(s.tz);
       const beep = document.getElementById("beep");
       if ([...beep.options].some(o => o.value === String(s.beep))) beep.value = String(s.beep);
       document.getElementById("mac").value = s.mac || "";
@@ -136,15 +196,31 @@ async function refresh(){
       renderSavedWifis(s.nets, s.ssid, s.wifi);
     }
   } catch (e) {
-    document.getElementById("where").textContent = "Page is open. The weight did not update.";
+    if (++misses >= 3) document.getElementById("where").textContent = "Weak Wi-Fi to the bottle. Showing the last weight, retrying…";
   }
   refreshing = false;
 }
-document.getElementById("tare").onclick = async () => { await fetch("/tare", {method:"POST"}); refresh(); };
+document.getElementById("tare").onclick = async () => {
+  if (!confirm("Take the bottle off first. Zero the empty scale now?")) return;
+  const place = document.getElementById("place");
+  try {
+    await post("/tare", "", 8000);
+    place.textContent = "Scale zeroed.";
+  } catch (e) {
+    place.textContent = "Zero did not reach the bottle. Try again.";
+  }
+  refresh();
+};
 document.getElementById("find").onclick = async () => {
   const box = document.getElementById("phones");
   box.textContent = "Searching… keep this phone close, with Bluetooth on.";
-  const list = await (await fetch("/phones", {cache:"no-store"})).json();
+  let list;
+  try {
+    list = await (await get("/phones", null, 20000)).json();
+  } catch (e) {
+    box.textContent = "Search did not finish. Try again.";
+    return;
+  }
   box.innerHTML = "";
   if (!list.length) {
     box.textContent = "No phones heard. Wake the phone, leave Bluetooth on, and search again.";
@@ -155,7 +231,12 @@ document.getElementById("find").onclick = async () => {
     b.type = "button";
     b.textContent = (p.name || "Nearby device") + "  " + p.mac;
     b.onclick = async () => {
-      await fetch("/phone", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"mac="+encodeURIComponent(p.mac)});
+      try {
+        await post("/phone", "mac="+encodeURIComponent(p.mac));
+      } catch (e) {
+        box.textContent = "Saving the phone did not reach the bottle. Try again.";
+        return;
+      }
       document.getElementById("mac").value = p.mac;
       document.getElementById("phone-now").textContent = "Saved phone " + p.mac;
       box.textContent = "";
@@ -166,7 +247,13 @@ document.getElementById("find").onclick = async () => {
 document.getElementById("scan-wifi").onclick = async () => {
   const box = document.getElementById("wifis");
   box.textContent = "Scanning 2.4 GHz Wi-Fi…";
-  const list = await (await fetch("/wifis", {cache:"no-store"})).json();
+  let list;
+  try {
+    list = await (await get("/wifis", null, 15000)).json();
+  } catch (e) {
+    box.textContent = "Scan did not finish. Try again.";
+    return;
+  }
   box.innerHTML = "";
   if (!list.length) {
     box.textContent = "No 2.4 GHz networks found.";
@@ -184,7 +271,25 @@ document.getElementById("scan-wifi").onclick = async () => {
     box.appendChild(b);
   });
 };
-function schedule(){ Promise.resolve(refresh()).finally(() => setTimeout(schedule, 250)); }
+document.getElementById("settings").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const note = document.getElementById("saved");
+  const body = new URLSearchParams(new FormData(form));
+  body.set("js", "1");
+  const wifiChange = !!body.get("ssid") || body.has("clear_wifi");
+  note.textContent = "Saving…";
+  try {
+    await post("/settings", body.toString(), 8000);
+    note.textContent = wifiChange ? "Saved. The bottle is reconnecting Wi-Fi; this page may pause." : "Saved.";
+    document.getElementById("pass").value = "";
+    form.querySelector('[name="clear_wifi"]').checked = false;
+    formReady = false;
+  } catch (e) {
+    note.textContent = "Save did not reach the bottle. Try again.";
+  }
+};
+function schedule(){ Promise.resolve(refresh()).finally(() => setTimeout(schedule, 1000)); }
 schedule();
 </script>
 </body>

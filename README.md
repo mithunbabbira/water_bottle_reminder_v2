@@ -33,8 +33,8 @@ Grams are `(raw − tare) / calibration`. The empty base is zeroed once with `t`
 
 The base waits 1.5 seconds after boot, then needs 3 samples, 120 ms apart, before it believes a change.
 
-- **Lifted.** Weight stays under 80 g. The saved baseline is kept, except at boot: if the bottle is already missing, the baseline is cleared and learned again when the bottle comes back.
-- **Returned.** Weight stays over 88 g. The base waits 2 seconds for the water to settle.
+- **Lifted.** Weight stays under 100 g. The saved baseline is kept, except at boot: if the bottle is already missing, the baseline is cleared and learned again when the bottle comes back.
+- **Returned.** Weight stays over 108 g. The base waits 2 seconds for the water to settle.
 - **Confirmed weight.** Two readings 250 ms apart. If they agree within 5 g, their average is used. If they do not, a third reading is taken and the median is used.
 - **Drink.** The bottle is at least 50 g lighter than the baseline. That difference is added to today’s millilitres (1 g is treated as 1 ml). The baseline moves to the new weight. Any reminder stops, and the interval starts again.
 - **Refill.** The bottle is at least 100 g heavier. The baseline moves up. Today’s total does not increase. Any reminder stops, and the interval starts again.
@@ -64,12 +64,12 @@ The drink reminder starts when the bottle has been on the base, the interval has
 - The bottle is lifted.
 - A drink of at least 50 g, or a refill of at least 100 g, is confirmed.
 - The bottle is put back after a missing alert.
-- The paired phone is no longer here. Reminders turn off, and the 3 minute missing timer does not run while you are away.
+- The paired phone is no longer here. Reminders turn off, and the missing timer does not run while you are away.
 - Quiet hours begin. The default window is 23:00–10:00 and can be changed on the page.
 - Do Not Disturb is on. The light can still show the alert color. The buzzer stays off.
 - The scale is zeroed. The baseline and any active reminder are cleared.
 
-Until a phone has been paired, reminders are allowed without a presence check. After pairing, the bottle remembers that phone’s identity key. It advertises again only when that phone disconnects, and a different phone replaces the previous bond. “Here” means the phone is connected, or it was seen within the last 90 seconds.
+Until a phone has been paired, reminders are allowed without a presence check. After pairing, the bottle remembers that phone’s address and identity key. It checks presence by opening a short Bluetooth Low Energy connection to that address, trying a public address and then a random one. A reply means the phone is here. No reply for 10 seconds means away. For the first 10 seconds after startup, before any reply, the phone still counts as here.
 
 ## Setup page
 
@@ -77,7 +77,7 @@ With no saved Wi-Fi, the bottle opens an open network named `bottle` at `http://
 
 The page shows live weight, whether the bottle is on the base, today’s millilitres, and the last drink. It can zero the scale, search for a nearby phone, search for nearby 2.4 GHz networks, and save Do Not Disturb, light color, quiet hours, interval, beep style, and Wi-Fi. The ESP32-C3 only hears 2.4 GHz, not 5 GHz.
 
-The clock uses NTP in IST (UTC+5:30) after Wi-Fi connects. Without a clock, quiet hours and the midnight reset stay off and the bottle runs as daytime.
+The clock uses NTP after Wi-Fi connects. The time zone is the place chosen on the page (Kolkata, UTC+5:30, until you change it) and is stored on the bottle. Quiet hours and the midnight reset use that local time. Without a clock, both stay off and the bottle runs as daytime. The zone is a fixed offset, so it does not move itself for daylight saving.
 
 ## Serial commands
 

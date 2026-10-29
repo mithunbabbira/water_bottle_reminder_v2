@@ -63,6 +63,7 @@ struct BottleNvmData {
   uint16_t endMin;
   uint16_t intervalMin;
   uint8_t beepType;
+  int16_t tzMin;
 
   char staSsid[BOTTLE_SSID_LEN];
   char staPass[BOTTLE_PASS_LEN];
@@ -118,6 +119,10 @@ class BottleNvm {
     data.endMin = prefs_.getUShort("end_min", 10 * 60);
     data.intervalMin = prefs_.getUShort("interval_min", 30);
     data.beepType = prefs_.getUChar("beep_type", BEEP_DOUBLE);
+    data.tzMin = prefs_.getShort("tz_min", 5 * 60 + 30);
+    if (data.tzMin < -12 * 60 || data.tzMin > 14 * 60 || data.tzMin % 15 != 0) {
+      data.tzMin = 5 * 60 + 30;
+    }
 
     loadString("sta_ssid", data.staSsid, sizeof(data.staSsid), "");
     loadString("sta_pass", data.staPass, sizeof(data.staPass), "");
@@ -189,6 +194,14 @@ class BottleNvm {
     data.colorB = b;
     const uint32_t packed = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
     return prefs_.putUInt("color", packed) > 0;
+  }
+
+  bool saveTz(int16_t minutes) {
+    if (minutes < -12 * 60 || minutes > 14 * 60 || minutes % 15 != 0) {
+      return false;
+    }
+    data.tzMin = minutes;
+    return prefs_.putShort("tz_min", minutes) > 0;
   }
 
   bool saveWindow(uint16_t startMin, uint16_t endMin) {

@@ -28,7 +28,8 @@ class Scale {
     raw_ = shift();
     rawMs_ = millis();
     haveRaw_ = true;
-    if (!nvm.hasTare || !nvm.hasCal) {
+    fault_ = railed(raw_);
+    if (fault_ || !nvm.hasTare || !nvm.hasCal) {
       haveGrams_ = false;
       return;
     }
@@ -44,6 +45,9 @@ class Scale {
     *raw = raw_;
     return true;
   }
+
+  // A stuck full-scale reading means a load-cell wire is open or shorted.
+  bool fault() const { return haveRaw_ && fault_; }
 
   bool latestGrams(float *grams, uint32_t maxAgeMs) const {
     if (!haveGrams_ || millis() - gramsMs_ > maxAgeMs) {
@@ -100,6 +104,9 @@ class Scale {
   uint32_t gramsMs_ = 0;
   bool haveRaw_ = false;
   bool haveGrams_ = false;
+  bool fault_ = false;
+
+  static bool railed(int32_t raw) { return raw <= -8388000 || raw >= 8388000; }
 
   bool waitLow(uint32_t timeoutMs) const {
     const uint32_t start = millis();
@@ -126,6 +133,10 @@ class Scale {
       return false;
     }
     *raw = sum / count;
+    if (railed(*raw)) {
+      fault_ = true;
+      return false;
+    }
     haveRaw_ = true;
     raw_ = *raw;
     rawMs_ = millis();
