@@ -117,6 +117,7 @@ function hm(m){const h=Math.floor(m/60), n=m%60; return String(h).padStart(2,"0"
 function hex(r,g,b){return "#"+[r,g,b].map(v=>Number(v).toString(16).padStart(2,"0")).join("");}
 let formReady = false;
 let refreshing = false;
+let saving = false;
 let misses = 0;
 async function get(url, opts, ms){
   const ctl = new AbortController();
@@ -165,11 +166,27 @@ function renderSavedWifis(nets, activeSsid, connected){
     box.appendChild(row);
   });
 }
+function pause(ms){ return new Promise((resolve) => setTimeout(resolve, ms)); }
+async function readStatus(){
+  const deadline = Date.now() + 12000;
+  let error;
+  while (Date.now() < deadline) {
+    const left = Math.max(1000, deadline - Date.now());
+    try {
+      return await (await get("/api", null, left)).json();
+    } catch (e) {
+      error = e;
+      if (Date.now() >= deadline) break;
+      await pause(400);
+    }
+  }
+  throw error || new Error("status");
+}
 async function refresh(){
-  if (refreshing) return Promise.resolve();
+  if (refreshing || saving) return Promise.resolve();
   refreshing = true;
   try {
-    const s = await (await get("/api", null, 3000)).json();
+    const s = await readStatus();
     misses = 0;
     document.getElementById("grams").textContent = s.grams == null ? "--" : s.grams;
     document.getElementById("place").textContent = s.fault ? "Scale fault: check the load cell wires to the HX711." : (s.grams == null ? "No weight reading." : (s.missing ? "Bottle is off the base." : "Bottle is on the base."));
@@ -185,7 +202,8 @@ async function refresh(){
       document.getElementById("color").value = hex(s.r, s.g, s.b);
       document.getElementById("start").value = hm(s.start);
       document.getElementById("end").value = hm(s.end);
-      document.getElementById("interval").value = s.interval;
+      const intervalEl = document.getElementById("interval");
+      if (intervalEl.dataset.edited !== "1") intervalEl.value = s.interval;
       const tz = document.getElementById("tz");
       if ([...tz.options].some(o => o.value === String(s.tz))) tz.value = String(s.tz);
       const beep = document.getElementById("beep");
@@ -271,6 +289,9 @@ document.getElementById("scan-wifi").onclick = async () => {
     box.appendChild(b);
   });
 };
+document.getElementById("interval").addEventListener("input", () => {
+  document.getElementById("interval").dataset.edited = "1";
+});
 document.getElementById("settings").onsubmit = async (ev) => {
   ev.preventDefault();
   const form = ev.target;
@@ -279,15 +300,19 @@ document.getElementById("settings").onsubmit = async (ev) => {
   body.set("js", "1");
   const wifiChange = !!body.get("ssid") || body.has("clear_wifi");
   note.textContent = "Saving…";
+  saving = true;
   try {
-    await post("/settings", body.toString(), 8000);
+    while (refreshing) await pause(100);
+    await post("/settings", body.toString(), 15000);
     note.textContent = wifiChange ? "Saved. The bottle is reconnecting Wi-Fi; this page may pause." : "Saved.";
     document.getElementById("pass").value = "";
     form.querySelector('[name="clear_wifi"]').checked = false;
+    document.getElementById("interval").dataset.edited = "";
     formReady = false;
   } catch (e) {
     note.textContent = "Save did not reach the bottle. Try again.";
   }
+  saving = false;
 };
 function schedule(){ Promise.resolve(refresh()).finally(() => setTimeout(schedule, 1000)); }
 schedule();

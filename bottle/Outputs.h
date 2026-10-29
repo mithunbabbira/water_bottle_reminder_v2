@@ -19,6 +19,33 @@ class Outputs {
     buzzer(false);
   }
 
+  // Cycles the RGB LED. Call often while Wi-Fi is still coming up.
+  void rainbow(uint32_t speedMs) {
+    const uint32_t now = millis();
+    if (now - rainbowMs_ < speedMs) {
+      return;
+    }
+    rainbowMs_ = now;
+    hue_ = (hue_ + 1) % 360;
+    const float h = hue_ / 60.0f;
+    const int band = (int)h;
+    const float frac = h - band;
+    const int down = (int)(255 * (1.0f - frac));
+    const int up = (int)(255 * frac);
+    uint8_t r = 0, g = 0, b = 0;
+    switch (band) {
+      case 0: r = 255; g = up; break;
+      case 1: r = down; g = 255; break;
+      case 2: g = 255; b = up; break;
+      case 3: g = down; b = 255; break;
+      case 4: r = up; b = 255; break;
+      default: r = 255; b = down; break;
+    }
+    rgb(r, g, b);
+    white(false);
+    buzzer(false);
+  }
+
   void show(uint8_t r, uint8_t g, uint8_t b, bool whiteOn, bool beepOn, uint8_t beepType) {
     rgb(r, g, b);
     white(whiteOn);
@@ -51,6 +78,8 @@ class Outputs {
 
  private:
   uint32_t chirpMs_ = 0;
+  uint32_t rainbowMs_ = 0;
+  int hue_ = 0;
   bool sounding_ = false;
 
   void rgb(uint8_t r, uint8_t g, uint8_t b) const {

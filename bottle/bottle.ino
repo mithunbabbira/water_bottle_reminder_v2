@@ -743,6 +743,7 @@ bool waitForRaw() {
   const uint32_t start = millis();
   while (millis() - start < WEIGHT_WAIT_MS) {
     scale.poll(nvm.data);
+    outputs.rainbow(30);
     int32_t raw = 0;
     if (scale.latestRaw(&raw, WEIGHT_WAIT_MS)) {
       return true;
@@ -853,7 +854,7 @@ void setup() {
   Serial.println("scale");
   const bool haveWeight = waitForRaw();
   printChecks(haveWeight);
-  portal.begin(&nvm, &scale, &hydration, &wallClock, phonesJson, currentAtHome);
+  portal.begin(&nvm, &scale, &hydration, &wallClock, phonesJson, currentAtHome, &outputs);
   if (nvm.data.staSsid[0] == '\0') {
     Serial.println("wifi: no credentials");
     printTime();

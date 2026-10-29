@@ -121,6 +121,15 @@ class Hydration {
     Serial.println("drink stops at 50 g, refill at 100 g, bottle off under 100 g");
   }
 
+  // A page save replaces any serial seconds override and waits this long from now.
+  void useSavedInterval(const BottleNvm &nvm) {
+    testIntervalSec_ = 0;
+    nextCheckMs_ = millis() + intervalMs(nvm);
+    Serial.print("check every ");
+    Serial.print(nvm.data.intervalMin);
+    Serial.println(" min");
+  }
+
  private:
   bool hasBaseline_ = false;
   float baseline_ = 0.0f;

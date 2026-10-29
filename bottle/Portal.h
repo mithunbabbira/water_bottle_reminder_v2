@@ -16,18 +16,51 @@
 // Serves the setup page and live hydration status.
 // The phone list and presence come from the sketch so serial and the page share BLE state.
 
+// One client at a time. A Wi-Fi mode change closes the listening socket but leaves
+// NetworkServer's _listening flag set, so a later begin() on that socket returns
+// without binding. WebServer::begin() closes first, which clears the flag.
+// A captive-portal probe that connects and sends nothing otherwise holds the only
+// client slot for five seconds, longer than the page will wait.
+class BottleHttp : public WebServer {
+ public:
+  explicit BottleHttp(uint16_t port) : WebServer(port) {}
+
+  void listenAgain() {
+    _currentClient.stop();
+    _currentClient = NetworkClient();
+    _currentStatus = HC_NONE;
+    begin();
+  }
+
+  void releaseIfStalled(uint32_t maxWaitMs) {
+    if (_currentStatus == HC_NONE) {
+      return;
+    }
+    if (millis() - _statusChange <= maxWaitMs) {
+      return;
+    }
+    _currentClient.stop();
+    _currentClient = NetworkClient();
+    _currentStatus = HC_NONE;
+  }
+
+  bool idle() const { return _currentStatus == HC_NONE; }
+};
+
 class Portal {
  public:
   using PhoneList = String (*)();
   using HomeCheck = AtHome (*)();
 
-  void begin(BottleNvm *nvm, Scale *scale, Hydration *hydration, Clock *clock, PhoneList phones, HomeCheck homeCheck) {
+  void begin(BottleNvm *nvm, Scale *scale, Hydration *hydration, Clock *clock, PhoneList phones, HomeCheck homeCheck,
+             Outputs *outputs) {
     nvm_ = nvm;
     scale_ = scale;
     hydration_ = hydration;
     clock_ = clock;
     phones_ = phones;
     homeCheck_ = homeCheck;
+    outputs_ = outputs;
     WiFi.persistent(false);
     WiFi.setHostname("bottle");
     startRadio();
@@ -57,13 +90,35 @@ class Portal {
       server_.send(302, "text/plain", "");
     });
     server_.begin();
+    WiFi.onEvent([this](arduino_event_id_t event, arduino_event_info_t) {
+      // Only the setup network coming up needs a new listen socket.
+      // Station disconnects must not close a page that is already sending.
+      if (event == ARDUINO_EVENT_WIFI_AP_START) {
+        relisten_ = true;
+      }
+    });
     Serial.println("page ready");
     if (nvm_->data.staSsid[0] == '\0') {
       return;
     }
-    const uint32_t wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 25000) {
-      server_.handleClient();
+    const uint32_t perNetMs = 15000;
+    uint32_t attemptStart = millis();
+    int attempts = 0;
+    const int netTotal = nvm_->data.netCount;
+    const int firstIdx = staIdx_;
+    while (WiFi.status() != WL_CONNECTED && attempts < netTotal) {
+      serviceHttp();
+      if (outputs_ != nullptr) {
+        outputs_->rainbow(30);
+      }
+      if (millis() - attemptStart >= perNetMs) {
+        attempts++;
+        if (attempts >= netTotal) {
+          break;
+        }
+        joinNet((firstIdx + attempts) % netTotal);
+        attemptStart = millis();
+      }
       delay(20);
     }
     if (WiFi.status() != WL_CONNECTED) {
@@ -72,7 +127,7 @@ class Portal {
     announceLan();
     const uint32_t timeStart = millis();
     while (millis() - timeStart < 10000) {
-      server_.handleClient();
+      serviceHttp();
       readClock();
       if (clock_->valid) {
         break;
@@ -82,7 +137,7 @@ class Portal {
   }
 
   void tick() {
-    server_.handleClient();
+    serviceHttp();
     if (apOn_) {
       dns_.processNextRequest();
     }
@@ -139,9 +194,24 @@ class Portal {
   Scale *scale_ = nullptr;
   Hydration *hydration_ = nullptr;
   Clock *clock_ = nullptr;
+  Outputs *outputs_ = nullptr;
+  int staIdx_ = 0;
   PhoneList phones_ = nullptr;
   HomeCheck homeCheck_ = nullptr;
-  WebServer server_{80};
+  BottleHttp server_{80};
+  volatile bool relisten_ = false;
+  bool sendingPage_ = false;
+  uint32_t lastListenMs_ = 0;
+
+  void serviceHttp() {
+    server_.releaseIfStalled(2000);
+    if (relisten_ && !sendingPage_ && server_.idle() && (int32_t)(millis() - lastListenMs_) > 300) {
+      relisten_ = false;
+      server_.listenAgain();
+      lastListenMs_ = millis();
+    }
+    server_.handleClient();
+  }
   DNSServer dns_;
   bool apOn_ = false;
   bool wasConnected_ = false;
@@ -152,6 +222,9 @@ class Portal {
   uint32_t restartAtMs_ = 0;
 
   int pickSavedNet() {
+    if (sendingPage_) {
+      return nvm_->data.netCount > 0 ? staIdx_ : -1;
+    }
     if (nvm_->data.netCount == 0) {
       return -1;
     }
@@ -183,7 +256,7 @@ class Portal {
   void announceLan() {
     WiFi.setSleep(WIFI_PS_NONE);
     WiFi.setTxPower(apOn_ ? WIFI_POWER_8_5dBm : WIFI_POWER_15dBm);
-    server_.begin();
+    relisten_ = true;
     MDNS.end();
     if (MDNS.begin("bottle")) {
       MDNS.addService("http", "tcp", 80);
@@ -208,16 +281,20 @@ class Portal {
       WiFi.mode(hasSta ? WIFI_AP_STA : WIFI_AP);
       openAp();
       if (hasSta) {
-        const int idx = pickSavedNet();
-        WiFi.begin(nvm_->data.nets[idx].ssid, nvm_->data.nets[idx].pass);
-        Serial.print("joining ");
-        Serial.println(nvm_->data.nets[idx].ssid);
+        joinNet(pickSavedNet());
       }
       return;
     }
     WiFi.mode(WIFI_STA);
     WiFi.setTxPower(WIFI_POWER_15dBm);
-    const int idx = pickSavedNet();
+    joinNet(pickSavedNet());
+  }
+
+  void joinNet(int idx) {
+    if (idx < 0 || idx >= nvm_->data.netCount) {
+      return;
+    }
+    staIdx_ = idx;
     WiFi.begin(nvm_->data.nets[idx].ssid, nvm_->data.nets[idx].pass);
     Serial.print("joining ");
     Serial.println(nvm_->data.nets[idx].ssid);
@@ -229,6 +306,7 @@ class Portal {
     }
     if (WiFi.getMode() == WIFI_STA) {
       WiFi.mode(WIFI_AP_STA);
+      relisten_ = true;
     }
     nvm_->data.apPass[0] = '\0';
     delay(200);
@@ -242,6 +320,7 @@ class Portal {
     WiFi.softAPbandwidth(WIFI_BW_HT20);
     const bool txOk = WiFi.setTxPower(WIFI_POWER_8_5dBm);
     apOn_ = true;
+    relisten_ = true;
     dns_.start(53, "*", WiFi.softAPIP());
     Serial.print("setup bottle open, channel 1, tx ");
     Serial.print(txOk ? "ok" : "not set");
@@ -345,9 +424,11 @@ class Portal {
   }
 
   void sendPage() {
+    sendingPage_ = true;
     armReply();
     server_.sendHeader("Content-Encoding", "gzip");
     server_.send_P(200, "text/html", (PGM_P)BOTTLE_PAGE_GZ, BOTTLE_PAGE_GZ_LEN);
+    sendingPage_ = false;
   }
 
   void sendPhones() {
@@ -356,6 +437,9 @@ class Portal {
   }
 
   String scanWifisJson() {
+    if (sendingPage_) {
+      return "[]";
+    }
     const int n = WiFi.scanNetworks(false, false);
     String json = "[";
     bool first = true;
@@ -468,8 +552,8 @@ class Portal {
     }
 
     const int minutes = server_.arg("interval").toInt();
-    if (minutes >= 1 && minutes <= 240) {
-      nvm_->saveInterval((uint16_t)minutes);
+    if (minutes >= 1 && minutes <= 240 && nvm_->saveInterval((uint16_t)minutes) && hydration_ != nullptr) {
+      hydration_->useSavedInterval(*nvm_);
     }
     const int beep = server_.arg("beep").toInt();
     if (beep >= 0 && beep <= BEEP_LONG) {
