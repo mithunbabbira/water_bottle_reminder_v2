@@ -1,23 +1,22 @@
 #pragma once
 
-// Active phone check. A short Bluetooth Low Energy connection to the paired
-// address means the phone is here. No reply for ten seconds means away.
-// The address is the printed order, the same order stored at pairing.
+// Phone check used only right before a reminder. A short BLE connection to the
+// paired address means the phone is here. No periodic ping.
 
 #include <Arduino.h>
 #include <host/ble_gap.h>
+
+#include "Config.h"
 
 #include <string.h>
 
 class PhonePresence {
  public:
   static const uint32_t PING_MS = 2000;
-  static const uint32_t AWAY_MS = 10000;
 
   void setAddress(const uint8_t mac[6]) {
     memcpy(mac_, mac, 6);
     hasMac_ = true;
-    startedMs_ = millis();
   }
 
   bool configured() const { return hasMac_; }
@@ -32,54 +31,53 @@ class PhonePresence {
     }
   }
 
-  // An existing link counts as a reply. Otherwise one address type is tried
-  // per call, so the bottle loop is not blocked for the whole timeout.
-  void tick(bool linkUp) {
-    if (!hasMac_ || suspended_) {
+  // Drop an in-flight ping so Wi-Fi can finish a page send on the shared radio.
+  void holdRadio(bool on) {
+    if (on == radioHeld_) {
       return;
     }
-    const uint32_t now = millis();
-    if (linkUp) {
-      markReply(now);
+    if (on) {
+      heldHere_ = lastHere_;
       cancel();
-      return;
+      delay(40);
     }
-    if (phase_ != PHASE_IDLE) {
-      if (pingDone_) {
-        const bool reply = pingStatus_ == 0;
-        pingDone_ = false;
-        phase_ = PHASE_IDLE;
-        if (reply) {
-          markReply(now);
-        } else if (type_ == BLE_ADDR_PUBLIC) {
-          start(BLE_ADDR_RANDOM, now);
-        }
-        return;
-      }
-      if (now - attemptMs_ > PING_MS + 300) {
-        ble_gap_conn_cancel();
-        phase_ = PHASE_IDLE;
-        if (type_ == BLE_ADDR_PUBLIC) {
-          start(BLE_ADDR_RANDOM, now);
-        }
-      }
-      return;
-    }
-    if (attemptMs_ != 0 && now - attemptMs_ < 500) {
-      return;
-    }
-    start(BLE_ADDR_PUBLIC, now);
+    radioHeld_ = on;
   }
 
   bool here() const {
     if (!hasMac_) {
       return true;
     }
-    const uint32_t now = millis();
-    if (!ever_ && now - startedMs_ < AWAY_MS) {
-      return true;
+    if (radioHeld_) {
+      return heldHere_;
     }
-    return ever_ && now - lastReplyMs_ < AWAY_MS;
+    return lastHere_;
+  }
+
+  // One public then one random attempt. Pumps the scale while waiting.
+  PhoneProbe probe(bool linkUp, void (*pump)()) {
+    if (!hasMac_) {
+      return PhoneProbe::Allow;
+    }
+    if (suspended_) {
+      return PhoneProbe::Deny;
+    }
+    if (radioHeld_) {
+      return PhoneProbe::Busy;
+    }
+    if (linkUp) {
+      lastHere_ = true;
+      return PhoneProbe::Allow;
+    }
+    Serial.println("phone check");
+    if (tryOnce(BLE_ADDR_PUBLIC, pump) || tryOnce(BLE_ADDR_RANDOM, pump)) {
+      lastHere_ = true;
+      Serial.println("phone here");
+      return PhoneProbe::Allow;
+    }
+    lastHere_ = false;
+    Serial.println("phone away");
+    return PhoneProbe::Deny;
   }
 
  private:
@@ -89,19 +87,14 @@ class PhonePresence {
   uint8_t mac_[6] = {};
   bool hasMac_ = false;
   bool suspended_ = false;
-  bool ever_ = false;
+  bool radioHeld_ = false;
+  bool heldHere_ = true;
+  bool lastHere_ = true;
   uint8_t phase_ = PHASE_IDLE;
   uint8_t type_ = BLE_ADDR_PUBLIC;
-  uint32_t startedMs_ = 0;
   uint32_t attemptMs_ = 0;
-  uint32_t lastReplyMs_ = 0;
   volatile int pingStatus_ = -1;
   volatile bool pingDone_ = false;
-
-  void markReply(uint32_t now) {
-    lastReplyMs_ = now;
-    ever_ = true;
-  }
 
   void cancel() {
     if (phase_ != PHASE_IDLE) {
@@ -135,5 +128,27 @@ class PhonePresence {
     attemptMs_ = now;
     const int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, PING_MS, nullptr, onGap, this);
     phase_ = rc == 0 ? PHASE_WAIT : PHASE_IDLE;
+  }
+
+  bool tryOnce(uint8_t addrType, void (*pump)()) {
+    const uint32_t now = millis();
+    start(addrType, now);
+    if (phase_ != PHASE_WAIT) {
+      return false;
+    }
+    const uint32_t deadline = now + PING_MS + 300;
+    while ((int32_t)(millis() - deadline) < 0 && !pingDone_) {
+      if (pump != nullptr) {
+        pump();
+      }
+      delay(5);
+    }
+    const bool reply = pingDone_ && pingStatus_ == 0;
+    if (!pingDone_) {
+      ble_gap_conn_cancel();
+    }
+    phase_ = PHASE_IDLE;
+    pingDone_ = false;
+    return reply;
   }
 };

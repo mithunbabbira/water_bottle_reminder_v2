@@ -26,6 +26,9 @@ static const uint32_t BLINK_MS = 500;
 static const uint32_t WARMUP_MS = 1500;
 static const uint32_t SAMPLE_MAX_AGE_MS = 400;
 static const uint32_t UNREADABLE_RETRY_MS = 5000;
+// 0 keeps the setup page and setup network running. Any other value is the
+// milliseconds after power-on before they stop.
+static const uint32_t PAGE_WINDOW_MS = 0;
 
 static const uint8_t QUIET_R = 0;
 static const uint8_t QUIET_G = 0;
@@ -53,3 +56,5 @@ struct AtHome {
   bool decided = false;
   bool home = false;
 };
+
+enum class PhoneProbe { Allow, Deny, Busy };

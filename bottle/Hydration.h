@@ -27,19 +27,10 @@ class Hydration {
     drinkFlashUntil_ = 0;
   }
 
-  void tick(uint32_t now, Scale &scale, BottleNvm &nvm, Outputs &out, const Clock &clock, const AtHome &atHome) {
+  using PhoneCheck = PhoneProbe (*)();
+
+  void tick(uint32_t now, Scale &scale, BottleNvm &nvm, Outputs &out, const Clock &clock, PhoneCheck phoneCheck) {
     rollDay(clock, nvm);
-    const bool away = atHome.watching && atHome.decided && !atHome.home;
-    // A lift keeps resumeAlert_ even if presence flaps while the bottle is in hand.
-    // Away only silences an alert that is actually running.
-    if (away && (drinkAlert_ || missingAlert_)) {
-      drinkAlert_ = false;
-      missingAlert_ = false;
-      Serial.println("you left, reminder off");
-    }
-    if (away && missing_) {
-      missingMs_ = now;
-    }
 
     float grams = 0.0f;
     const bool fresh = scale.latestGrams(&grams, SAMPLE_MAX_AGE_MS);
@@ -60,24 +51,36 @@ class Hydration {
       return;
     }
 
+    if (missing_ && !missingAlert_ && !quiet && now - missingMs_ >= MISSING_ALERT_MS) {
+      const PhoneProbe phone = checkPhone(now, phoneCheck);
+      if (phone == PhoneProbe::Allow) {
+        missingAlert_ = true;
+        alertMs_ = now;
+        blinkMs_ = now;
+        Serial.println("missing alert");
+      } else if (phone == PhoneProbe::Deny) {
+        missingMs_ = now;
+        Serial.println("away, missing alert skipped");
+      }
+    }
+
     if (stabilizing_) {
       if (now - stabilizeMs_ >= STABILIZE_MS) {
         stabilizing_ = false;
         const WeighResult result = weigh(scale, nvm);
-        settleReturn(now, result, quiet, atHome);
+        settleReturn(now, result, quiet, phoneCheck);
       }
     } else if (resumeAlert_ && !missing_ && !drinkAlert_ && !quiet && (int32_t)(now - nextCheckMs_) >= 0) {
       const WeighResult result = weigh(scale, nvm);
-      settleReturn(now, result, quiet, atHome);
+      settleReturn(now, result, quiet, phoneCheck);
     } else if (!missing_ && !drinkAlert_ && !quiet && (int32_t)(now - nextCheckMs_) >= 0) {
       const WeighResult result = weigh(scale, nvm);
       if (result == WeighResult::NoChange) {
-        if (!phoneAllows(atHome)) {
-          if (atHome.watching && !atHome.decided) {
-            nextCheckMs_ = now + UNREADABLE_RETRY_MS;
-          } else {
-            Serial.println("away, reminder skipped");
-          }
+        const PhoneProbe phone = checkPhone(now, phoneCheck);
+        if (phone == PhoneProbe::Busy) {
+          nextCheckMs_ = now + 1000;
+        } else if (phone == PhoneProbe::Deny) {
+          Serial.println("away, reminder skipped");
         } else if (!quiet) {
           startAlert(now);
         }
@@ -156,6 +159,7 @@ class Hydration {
   uint32_t nextCheckMs_ = 0;
   uint32_t warmupUntil_ = 0;
   uint32_t drinkFlashUntil_ = 0;
+  uint32_t probeBusyUntil_ = 0;
   uint16_t testIntervalSec_ = 0;
   void (*pump_)() = nullptr;
 
@@ -271,7 +275,7 @@ class Hydration {
   // After a put-down, weigh once. A real drink or refill ends the reminder.
   // No change resumes it when the phone is here, and retries soon if the ping
   // missed at that moment. The resume flag survives an away reading while lifted.
-  void settleReturn(uint32_t now, WeighResult result, bool quiet, const AtHome &atHome) {
+  void settleReturn(uint32_t now, WeighResult result, bool quiet, PhoneCheck phoneCheck) {
     if (result == WeighResult::Drink || result == WeighResult::Refill || result == WeighResult::NewBaseline) {
       resumeAlert_ = false;
       return;
@@ -279,7 +283,8 @@ class Hydration {
     if (!resumeAlert_ || result != WeighResult::NoChange) {
       return;
     }
-    if (!quiet && phoneAllows(atHome)) {
+    const PhoneProbe phone = checkPhone(now, phoneCheck);
+    if (!quiet && phone == PhoneProbe::Allow) {
       startAlert(now);
       resumeAlert_ = false;
       Serial.println("reminder resumed");
@@ -396,13 +401,7 @@ class Hydration {
 
   void paint(uint32_t now, const BottleNvm &nvm, Outputs &out, bool quiet) {
     const bool beepAllowed = !nvm.data.dnd && !quiet;
-    if (missing_ && now - missingMs_ >= MISSING_ALERT_MS) {
-      if (!missingAlert_) {
-        missingAlert_ = true;
-        alertMs_ = now;
-        blinkMs_ = now;
-        Serial.println("missing alert");
-      }
+    if (missing_ && missingAlert_) {
       const bool on = blink(now);
       const bool beep = beepAllowed && !on && now - alertMs_ >= BEEP_DELAY_MS;
       if (on) {
@@ -447,11 +446,18 @@ class Hydration {
     return blinkOn_;
   }
 
-  static bool phoneAllows(const AtHome &atHome) {
-    if (!atHome.watching) {
-      return true;
+  PhoneProbe checkPhone(uint32_t now, PhoneCheck phoneCheck) {
+    if (phoneCheck == nullptr) {
+      return PhoneProbe::Allow;
     }
-    return atHome.decided && atHome.home;
+    if ((int32_t)(now - probeBusyUntil_) < 0) {
+      return PhoneProbe::Busy;
+    }
+    const PhoneProbe result = phoneCheck();
+    if (result == PhoneProbe::Busy) {
+      probeBusyUntil_ = now + 1000;
+    }
+    return result;
   }
 
   uint32_t intervalMs(const BottleNvm &nvm) const {

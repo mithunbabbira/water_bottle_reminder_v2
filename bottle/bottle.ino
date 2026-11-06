@@ -64,6 +64,9 @@ volatile uint32_t phoneSeenMs = 0;
 volatile bool phoneEverSeen = false;
 
 static const uint32_t WEIGHT_WAIT_MS = 2000;
+static const uint32_t BLE_AFTER_WIFI_MS = 25000;
+bool bleStarted = false;
+uint32_t bleAfterMs = 0;
 
 PhonePresence presence;
 
@@ -269,6 +272,22 @@ bool phoneIsConnected() {
   return connected;
 }
 
+void holdPing(bool on) { presence.holdRadio(on); }
+
+void pumpScale() { scale.poll(nvm.data); }
+
+PhoneProbe probePhone() {
+  presence.suspend(pairing);
+  const bool configured = nvm.data.hasIrk || nvm.data.hasBleMac;
+  if (!configured) {
+    return PhoneProbe::Allow;
+  }
+  if (pairing) {
+    return PhoneProbe::Deny;
+  }
+  return presence.probe(phoneIsConnected(), pumpScale);
+}
+
 AtHome currentAtHome() {
   AtHome home;
   const bool configured = nvm.data.hasIrk || nvm.data.hasBleMac;
@@ -278,8 +297,6 @@ AtHome currentAtHome() {
     home.home = true;
     return home;
   }
-  presence.suspend(pairing);
-  presence.tick(phoneIsConnected());
   home.watching = true;
   home.decided = true;
   home.home = presence.here();
@@ -854,7 +871,7 @@ void setup() {
   Serial.println("scale");
   const bool haveWeight = waitForRaw();
   printChecks(haveWeight);
-  portal.begin(&nvm, &scale, &hydration, &wallClock, phonesJson, currentAtHome, &outputs);
+  portal.begin(&nvm, &scale, &hydration, &wallClock, phonesJson, currentAtHome, &outputs, holdPing);
   if (nvm.data.staSsid[0] == '\0') {
     Serial.println("wifi: no credentials");
     printTime();
@@ -865,11 +882,23 @@ void setup() {
     Serial.println("wifi: not connected");
     printTime();
   }
+  // BLE advertising during the WPA handshake is a known C3 failure mode.
+  bleAfterMs = millis() + BLE_AFTER_WIFI_MS;
+  if (WiFi.status() == WL_CONNECTED || nvm.data.staSsid[0] == '\0') {
+    startBleNow();
+  }
+  printHelp();
+}
+
+void startBleNow() {
+  if (bleStarted) {
+    return;
+  }
+  bleStarted = true;
   if (nvm.data.hasIrk) {
     startBleServer(false);
   }
   bindPresence();
-  printHelp();
 }
 
 void loop() {
@@ -879,11 +908,14 @@ void loop() {
   reportDrops();
   finishPair();
   scale.poll(nvm.data);
+  if (!bleStarted && (WiFi.status() == WL_CONNECTED || (int32_t)(millis() - bleAfterMs) >= 0)) {
+    startBleNow();
+  }
   if (pairing && millis() - pairingMs > PAIRING_WINDOW_MS) {
     pairing = false;
   }
   const AtHome home = currentAtHome();
   reportPresence(home);
-  hydration.tick(millis(), scale, nvm, outputs, wallClock, home);
+  hydration.tick(millis(), scale, nvm, outputs, wallClock, probePhone);
   printSample(millis());
 }

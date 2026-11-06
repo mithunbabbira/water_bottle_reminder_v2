@@ -45,15 +45,23 @@ class BottleHttp : public WebServer {
   }
 
   bool idle() const { return _currentStatus == HC_NONE; }
+
+  void stopListen() {
+    _currentClient.stop();
+    _currentClient = NetworkClient();
+    _currentStatus = HC_NONE;
+    close();
+  }
 };
 
 class Portal {
  public:
   using PhoneList = String (*)();
   using HomeCheck = AtHome (*)();
+  using PingHold = void (*)(bool);
 
   void begin(BottleNvm *nvm, Scale *scale, Hydration *hydration, Clock *clock, PhoneList phones, HomeCheck homeCheck,
-             Outputs *outputs) {
+             Outputs *outputs, PingHold pingHold) {
     nvm_ = nvm;
     scale_ = scale;
     hydration_ = hydration;
@@ -61,6 +69,9 @@ class Portal {
     phones_ = phones;
     homeCheck_ = homeCheck;
     outputs_ = outputs;
+    pingHold_ = pingHold;
+    pageUntilMs_ = PAGE_WINDOW_MS == 0 ? 0 : millis() + PAGE_WINDOW_MS;
+    pageClosed_ = false;
     WiFi.persistent(false);
     WiFi.setHostname("bottle");
     startRadio();
@@ -93,11 +104,11 @@ class Portal {
     WiFi.onEvent([this](arduino_event_id_t event, arduino_event_info_t) {
       // Only the setup network coming up needs a new listen socket.
       // Station disconnects must not close a page that is already sending.
-      if (event == ARDUINO_EVENT_WIFI_AP_START) {
+      if (event == ARDUINO_EVENT_WIFI_AP_START && !pageClosed_) {
         relisten_ = true;
       }
     });
-    Serial.println("page ready");
+    Serial.println(PAGE_WINDOW_MS == 0 ? "page stays up" : "page for 5 min");
     if (nvm_->data.staSsid[0] == '\0') {
       return;
     }
@@ -107,7 +118,7 @@ class Portal {
     const int netTotal = nvm_->data.netCount;
     const int firstIdx = staIdx_;
     while (WiFi.status() != WL_CONNECTED && attempts < netTotal) {
-      serviceHttp();
+      serviceOrClosePage();
       if (outputs_ != nullptr) {
         outputs_->rainbow(30);
       }
@@ -127,7 +138,7 @@ class Portal {
     announceLan();
     const uint32_t timeStart = millis();
     while (millis() - timeStart < 10000) {
-      serviceHttp();
+      serviceOrClosePage();
       readClock();
       if (clock_->valid) {
         break;
@@ -137,9 +148,11 @@ class Portal {
   }
 
   void tick() {
-    serviceHttp();
-    if (apOn_) {
-      dns_.processNextRequest();
+    if (!pageClosed_) {
+      serviceOrClosePage();
+      if (apOn_ && !pageClosed_) {
+        dns_.processNextRequest();
+      }
     }
     if (restartAtMs_ != 0 && (int32_t)(millis() - restartAtMs_) >= 0) {
       restartAtMs_ = 0;
@@ -150,6 +163,10 @@ class Portal {
       announceLan();
     }
     readClock();
+    if (pageClosed_) {
+      wasConnected_ = connected;
+      return;
+    }
     const uint32_t now = millis();
     const uint8_t behavior = nvm_->data.apBehavior;
     if (!connected && nvm_->data.staSsid[0] && !apOn_ && now - staStartedMs_ > 15000 &&
@@ -198,19 +215,74 @@ class Portal {
   int staIdx_ = 0;
   PhoneList phones_ = nullptr;
   HomeCheck homeCheck_ = nullptr;
+  PingHold pingHold_ = nullptr;
   BottleHttp server_{80};
   volatile bool relisten_ = false;
   bool sendingPage_ = false;
+  bool pageClosed_ = false;
   uint32_t lastListenMs_ = 0;
+  uint32_t pageUntilMs_ = 0;
+
+  void holdPing(bool on) {
+    if (pingHold_ != nullptr) {
+      pingHold_(on);
+    }
+  }
 
   void serviceHttp() {
+    if (pageClosed_) {
+      return;
+    }
     server_.releaseIfStalled(2000);
     if (relisten_ && !sendingPage_ && server_.idle() && (int32_t)(millis() - lastListenMs_) > 300) {
       relisten_ = false;
       server_.listenAgain();
       lastListenMs_ = millis();
     }
+    if (!server_.idle()) {
+      holdPing(true);
+    }
     server_.handleClient();
+    if (server_.idle() && !sendingPage_) {
+      holdPing(false);
+    }
+  }
+
+  void closePage() {
+    if (pageClosed_) {
+      return;
+    }
+    pageClosed_ = true;
+    sendingPage_ = false;
+    relisten_ = false;
+    holdPing(false);
+    server_.stopListen();
+    MDNS.end();
+    closeAp();
+    // Keep home Wi-Fi up after the page stops. WIFI_OFF here is why 192.168.1.14
+    // vanished when join had not finished before the five-minute window ended.
+    if (nvm_->data.netCount > 0) {
+      WiFi.mode(WIFI_STA);
+      WiFi.setTxPower(WIFI_POWER_15dBm);
+      if (WiFi.status() != WL_CONNECTED) {
+        joinNet(staIdx_ >= 0 ? staIdx_ : 0);
+      }
+    } else {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    }
+    Serial.println("page closed");
+  }
+
+  void serviceOrClosePage() {
+    if (pageClosed_) {
+      return;
+    }
+    if (pageUntilMs_ != 0 && (int32_t)(millis() - pageUntilMs_) >= 0 && !sendingPage_ && server_.idle()) {
+      closePage();
+      return;
+    }
+    serviceHttp();
   }
   DNSServer dns_;
   bool apOn_ = false;
@@ -256,26 +328,42 @@ class Portal {
   void announceLan() {
     WiFi.setSleep(WIFI_PS_NONE);
     WiFi.setTxPower(apOn_ ? WIFI_POWER_8_5dBm : WIFI_POWER_15dBm);
-    relisten_ = true;
-    MDNS.end();
-    if (MDNS.begin("bottle")) {
-      MDNS.addService("http", "tcp", 80);
-    }
     clockStarted_ = true;
     applyClock();
+    if (!pageClosed_) {
+      relisten_ = true;
+      MDNS.end();
+      if (MDNS.begin("bottle")) {
+        MDNS.addService("http", "tcp", 80);
+      }
+    }
     Serial.print("wifi ");
     Serial.print(WiFi.SSID());
     Serial.print(" ");
     Serial.print(WiFi.localIP());
     Serial.print(" rssi ");
     Serial.print(WiFi.RSSI());
-    Serial.println(" (http://bottle.local/)");
+    if (pageClosed_) {
+      Serial.println();
+    } else {
+      Serial.println(" (http://bottle.local/)");
+    }
   }
 
   void startRadio() {
     staStartedMs_ = millis();
     WiFi.setSleep(WIFI_PS_NONE);
     const bool hasSta = nvm_->data.netCount > 0;
+    if (pageClosed_) {
+      if (hasSta) {
+        WiFi.mode(WIFI_STA);
+        WiFi.setTxPower(WIFI_POWER_15dBm);
+        joinNet(pickSavedNet());
+      } else {
+        WiFi.mode(WIFI_OFF);
+      }
+      return;
+    }
     const bool alwaysAp = nvm_->data.apBehavior == BOTTLE_AP_ALWAYS;
     if (!hasSta || alwaysAp) {
       WiFi.mode(hasSta ? WIFI_AP_STA : WIFI_AP);
@@ -301,7 +389,7 @@ class Portal {
   }
 
   void openAp() {
-    if (apOn_) {
+    if (apOn_ || pageClosed_) {
       return;
     }
     if (WiFi.getMode() == WIFI_STA) {
@@ -425,6 +513,7 @@ class Portal {
 
   void sendPage() {
     sendingPage_ = true;
+    holdPing(true);
     armReply();
     server_.sendHeader("Content-Encoding", "gzip");
     server_.send_P(200, "text/html", (PGM_P)BOTTLE_PAGE_GZ, BOTTLE_PAGE_GZ_LEN);
@@ -598,6 +687,7 @@ class Portal {
   }
 
   void sendStatus() {
+    holdPing(true);
     char body[896];
     writeStatus(body, sizeof(body));
     armReply();
