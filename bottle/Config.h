@@ -2,13 +2,15 @@
 
 #include <Arduino.h>
 
-static const int PIN_DT = 4;
-static const int PIN_SCK = 3;
-static const int PIN_WHITE = 1;
-static const int PIN_BUZZER = 10;
-static const int PIN_R = 5;
-static const int PIN_G = 6;
-static const int PIN_B = 7;
+// ESP32-WROOM pins (same map as the old hydration_v3 bottle).
+// Do not use the C3 Super Mini numbers on this board.
+static const int PIN_DT = 32;
+static const int PIN_SCK = 33;
+static const int PIN_WHITE = 25;
+static const int PIN_BUZZER = 26;
+static const int PIN_R = 27;
+static const int PIN_G = 14;
+static const int PIN_B = 12;
 
 static const float MISSING_GRAMS = 100.0f;
 static const float PRESENT_GRAMS = 108.0f;
@@ -26,9 +28,6 @@ static const uint32_t BLINK_MS = 500;
 static const uint32_t WARMUP_MS = 1500;
 static const uint32_t SAMPLE_MAX_AGE_MS = 400;
 static const uint32_t UNREADABLE_RETRY_MS = 5000;
-// 0 keeps the setup page and setup network running. Any other value is the
-// milliseconds after power-on before they stop.
-static const uint32_t PAGE_WINDOW_MS = 0;
 
 static const uint8_t QUIET_R = 0;
 static const uint8_t QUIET_G = 0;
@@ -49,12 +48,6 @@ struct Clock {
   int hour = 0;
   int minute = 0;
   int32_t day = 0;
-};
-
-struct AtHome {
-  bool watching = false;
-  bool decided = false;
-  bool home = false;
 };
 
 enum class PhoneProbe { Allow, Deny, Busy };

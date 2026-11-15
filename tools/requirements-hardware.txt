@@ -1,0 +1,4 @@
+# Install only into a dedicated virtual environment; Python 3.10+.
+# bleak is optional if running serial_smoke.py only.
+pyserial==3.5
+bleak==1.1.1

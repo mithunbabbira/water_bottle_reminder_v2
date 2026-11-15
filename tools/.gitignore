@@ -1,0 +1,4 @@
+__pycache__/
+.venv-hardware/
+artifacts/
+.smoke-test-*/

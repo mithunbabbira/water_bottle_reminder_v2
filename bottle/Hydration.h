@@ -1,491 +1,110 @@
 #pragma once
 
+#include "ClockService.h"
+#include "HydrationEngine.h"
 #include "Outputs.h"
 #include "Scale.h"
 
-// Boot does not tare, does not delete baseline_weight, and does not judge a drink.
-// Baseline changes only when a drink or refill is confirmed, or the user tares.
-
-enum class WeighResult { Unreadable, Waiting, NoChange, NewBaseline, Drink, Refill };
-
+// Thin ESP adapter. Scale is polled by the main loop; tick never polls/waits,
+// probes a phone, delays, or calls a network API. sequence() identifies actual
+// conversions, so a cached value cannot confirm presence or a drink repeatedly.
 class Hydration {
  public:
   void begin(const BottleNvmData &nvm) {
-    hasBaseline_ = nvm.hasBaseline;
-    baseline_ = nvm.baselineWeight;
-    dailyMl_ = nvm.dailyTotalMl;
-    lastDay_ = nvm.lastDay;
-    warmupUntil_ = millis() + WARMUP_MS;
+    engine_.begin(millis(), nvm.hasBaseline, nvm.baselineWeight, nvm.dailyTotalMl, nvm.lastDay);
+    testIntervalSec_ = 0;
+    lastPersistAttemptMs_ = 0;
+    attemptedPersist_ = false;
+    persistenceFailed_ = false;
   }
 
-  void forgetBaseline(BottleNvm &nvm) {
-    hasBaseline_ = false;
-    baseline_ = 0.0f;
-    nvm.clearBaseline();
-    drinkAlert_ = false;
-    resumeAlert_ = false;
-    drinkFlashUntil_ = 0;
+  void tick(uint32_t now, Scale &scale, BottleNvm &nvm, Outputs &out, const Clock &clock, bool phoneHere) {
+    HydrationSettings settings;
+    settings.intervalMs = testIntervalSec_ ? static_cast<uint32_t>(testIntervalSec_) * 1000UL :
+                                          static_cast<uint32_t>(nvm.data.intervalMin) * 60000UL;
+    settings.missingMs = static_cast<uint32_t>(nvm.data.missingSec) * 1000UL;
+    settings.beepDelayMs = static_cast<uint32_t>(nvm.data.beepDelaySec) * 1000UL;
+    settings.drinkGrams = nvm.data.drinkGrams;
+    settings.settleMs = nvm.data.settleMs;
+    settings.idleColor = (static_cast<uint32_t>(nvm.data.colorR) << 16) |
+                         (static_cast<uint32_t>(nvm.data.colorG) << 8) | nvm.data.colorB;
+    settings.reminderColor = nvm.data.reminderColor;
+    settings.missingColor = nvm.data.missingColor;
+    settings.beepType = nvm.data.beepType;
+    settings.dnd = nvm.data.dnd;
+    settings.presenceEnabled = nvm.data.presenceEnabled;
+    HydrationInput input;
+    input.scaleValid = nvm.data.hasTare && nvm.data.hasCal && !scale.busy() &&
+                       scale.latestGrams(&input.grams, SAMPLE_MAX_AGE_MS);
+    input.scaleFault = scale.fault();
+    input.sequence = scale.sequence();
+    input.clockValid = clock.valid;
+    input.activeWindow = ClockService::inActiveWindow(nvm.data, clock);
+    input.day = clock.day;
+    input.phoneHere = phoneHere;
+    engine_.tick(now, settings, input);
+    const HydrationFrame &frame = engine_.frame();
+    // Silence outputs BEFORE attempting a flash write. A failed write is retried
+    // at most once every 5 s, not every fast main-loop iteration.
+    out.show((frame.color >> 16) & 255, (frame.color >> 8) & 255, frame.color & 255,
+             frame.white, frame.beep, settings.beepType);
+    persist(now, nvm);
   }
 
-  using PhoneCheck = PhoneProbe (*)();
-
-  void tick(uint32_t now, Scale &scale, BottleNvm &nvm, Outputs &out, const Clock &clock, PhoneCheck phoneCheck) {
-    rollDay(clock, nvm);
-
-    float grams = 0.0f;
-    const bool fresh = scale.latestGrams(&grams, SAMPLE_MAX_AGE_MS);
-    const bool quiet = inQuiet(nvm.data, clock);
-
-    if (now < warmupUntil_ || !fresh) {
-      paint(now, nvm, out, quiet);
-      return;
-    }
-
-    const bool wasReady = bootReady_;
-    trackPresence(now, grams);
-    if (!wasReady && bootReady_) {
-      onBootReady(now, grams, nvm);
-    }
-    if (!bootReady_) {
-      paint(now, nvm, out, quiet);
-      return;
-    }
-
-    if (missing_ && !missingAlert_ && !quiet && now - missingMs_ >= MISSING_ALERT_MS) {
-      const PhoneProbe phone = checkPhone(now, phoneCheck);
-      if (phone == PhoneProbe::Allow) {
-        missingAlert_ = true;
-        alertMs_ = now;
-        blinkMs_ = now;
-        Serial.println("missing alert");
-      } else if (phone == PhoneProbe::Deny) {
-        missingMs_ = now;
-        Serial.println("away, missing alert skipped");
-      }
-    }
-
-    if (stabilizing_) {
-      if (now - stabilizeMs_ >= STABILIZE_MS) {
-        stabilizing_ = false;
-        const WeighResult result = weigh(scale, nvm);
-        settleReturn(now, result, quiet, phoneCheck);
-      }
-    } else if (resumeAlert_ && !missing_ && !drinkAlert_ && !quiet && (int32_t)(now - nextCheckMs_) >= 0) {
-      const WeighResult result = weigh(scale, nvm);
-      settleReturn(now, result, quiet, phoneCheck);
-    } else if (!missing_ && !drinkAlert_ && !quiet && (int32_t)(now - nextCheckMs_) >= 0) {
-      const WeighResult result = weigh(scale, nvm);
-      if (result == WeighResult::NoChange) {
-        const PhoneProbe phone = checkPhone(now, phoneCheck);
-        if (phone == PhoneProbe::Busy) {
-          nextCheckMs_ = now + 1000;
-        } else if (phone == PhoneProbe::Deny) {
-          Serial.println("away, reminder skipped");
-        } else if (!quiet) {
-          startAlert(now);
-        }
-      }
-    }
-
-    paint(now, nvm, out, quiet);
+  // Call after a successful explicit tare/calibration. Clears ALL transient
+  // alarm/presence/settling state and starts warmup again; never auto-tares.
+  bool forgetBaseline(BottleNvm &nvm) {
+    engine_.resetAfterTare(millis());
+    attemptedPersist_ = false;
+    return persist(millis(), nvm);
   }
-
-  float baseline() const { return baseline_; }
-  bool hasBaseline() const { return hasBaseline_; }
-  float dailyMl() const { return dailyMl_; }
-  bool missing() const { return missing_; }
-  bool alerting() const { return drinkAlert_ || missingAlert_; }
-  bool hasLastDrink() const { return hasLastDrink_; }
-  float lastDrinkMl() const { return lastDrinkMl_; }
-  void setPump(void (*pump)()) { pump_ = pump; }
-
-  void clearToday(BottleNvm &nvm) {
-    dailyMl_ = 0.0f;
-    lastDrinkMl_ = 0.0f;
-    hasLastDrink_ = false;
-    nvm.saveTotals(dailyMl_, lastDay_);
+  bool clearToday(BottleNvm &nvm) {
+    engine_.clearToday(); attemptedPersist_ = false;
+    return persist(millis(), nvm);
   }
-
-  // Seconds override lasts until reboot. Zero uses the saved minute interval.
   void setCheckSeconds(uint16_t seconds, const BottleNvm &nvm) {
     testIntervalSec_ = seconds;
-    if (bootReady_ && hasBaseline_ && !missing_ && !stabilizing_ && !drinkAlert_) {
-      nextCheckMs_ = millis() + intervalMs(nvm);
-    }
-    if (seconds == 0) {
-      Serial.print("check every ");
-      Serial.print(nvm.data.intervalMin == 0 ? 30 : nvm.data.intervalMin);
-      Serial.println(" min");
-    } else {
-      Serial.print("check every ");
-      Serial.print(seconds);
-      Serial.println(" s");
-    }
-    Serial.println("drink stops at 50 g, refill at 100 g, bottle off under 100 g");
+    engine_.restartInterval(millis(), seconds ? static_cast<uint32_t>(seconds) * 1000UL :
+                                              static_cast<uint32_t>(nvm.data.intervalMin) * 60000UL);
   }
-
-  // A page save replaces any serial seconds override and waits this long from now.
   void useSavedInterval(const BottleNvm &nvm) {
     testIntervalSec_ = 0;
-    nextCheckMs_ = millis() + intervalMs(nvm);
-    Serial.print("check every ");
-    Serial.print(nvm.data.intervalMin);
-    Serial.println(" min");
+    engine_.restartInterval(millis(), static_cast<uint32_t>(nvm.data.intervalMin) * 60000UL);
   }
+  // Kept for older setup code; the engine deliberately never invokes a pump.
+  void setPump(void (*)()) {}
+
+  float baseline() const { return engine_.baseline(); }
+  bool hasBaseline() const { return engine_.hasBaseline(); }
+  float dailyMl() const { return engine_.dailyMl(); }
+  bool missing() const { return engine_.missing(); }
+  bool alerting() const { return engine_.alerting(); }
+  bool hasLastDrink() const { return engine_.hasLastDrink(); }
+  float lastDrinkMl() const { return engine_.lastDrinkMl(); }
+  bool ready() const { return engine_.ready(); }
+  bool scaleError() const { return engine_.scaleError(); }
+  const char *stateName() const { return engine_.stateName(); }
+  uint32_t nextCheckSeconds(uint32_t now) const { return engine_.nextCheckSeconds(now); }
+  bool persistenceFailed() const { return persistenceFailed_; }
+  bool storageFault() const { return persistenceFailed_; }
+  bool persistencePending() const { return engine_.persistenceDirty(); }
+  // Bitmask of HydrationEngine::Event, retained until consumed. Several events
+  // can occur in one tick (e.g. return/no-change/reminder). Drink ml is lastDrinkMl().
+  uint16_t takeEvents() { return engine_.takeEvents(); }
 
  private:
-  bool hasBaseline_ = false;
-  float baseline_ = 0.0f;
-  float dailyMl_ = 0.0f;
-  float lastDrinkMl_ = 0.0f;
-  bool hasLastDrink_ = false;
-  int32_t lastDay_ = 0;
-
-  bool bootReady_ = false;
-  bool missing_ = false;
-  bool stabilizing_ = false;
-  bool drinkAlert_ = false;
-  bool resumeAlert_ = false;
-  bool missingAlert_ = false;
-  bool blinkOn_ = false;
-
-  int missingCount_ = 0;
-  int presentCount_ = 0;
-  uint32_t sampleMs_ = 0;
-  uint32_t missingMs_ = 0;
-  uint32_t stabilizeMs_ = 0;
-  uint32_t alertMs_ = 0;
-  uint32_t blinkMs_ = 0;
-  uint32_t nextCheckMs_ = 0;
-  uint32_t warmupUntil_ = 0;
-  uint32_t drinkFlashUntil_ = 0;
-  uint32_t probeBusyUntil_ = 0;
+  HydrationEngine engine_;
   uint16_t testIntervalSec_ = 0;
-  void (*pump_)() = nullptr;
+  uint32_t lastPersistAttemptMs_ = 0;
+  bool attemptedPersist_ = false, persistenceFailed_ = false;
 
-  void pause(uint32_t ms) {
-    const uint32_t start = millis();
-    while (millis() - start < ms) {
-      if (pump_ != nullptr) {
-        pump_();
-      } else {
-        delay(5);
-      }
-    }
-  }
-
-  void onBootReady(uint32_t now, float grams, BottleNvm &nvm) {
-    if (missing_) {
-      hasBaseline_ = false;
-      baseline_ = 0.0f;
-      nvm.clearBaseline();
-      Serial.println("boot: bottle missing, baseline cleared");
-      return;
-    }
-    if (!hasBaseline_) {
-      nextCheckMs_ = now;
-      Serial.println("boot: bottle present, learning baseline");
-      return;
-    }
-    if (fabsf(grams - baseline_) >= REFILL_GRAMS) {
-      adopt(nvm, grams);
-      nextCheckMs_ = now + intervalMs(nvm);
-      Serial.print("boot: baseline rebased ");
-      Serial.println(baseline_, 1);
-      return;
-    }
-    nextCheckMs_ = now + intervalMs(nvm);
-    Serial.print("boot: baseline kept ");
-    Serial.println(baseline_, 1);
-  }
-
-  void trackPresence(uint32_t now, float grams) {
-    if (now - sampleMs_ < SAMPLE_MS) {
-      return;
-    }
-    sampleMs_ = now;
-
-    if (!bootReady_) {
-      if (grams < MISSING_GRAMS) {
-        presentCount_ = 0;
-        if (++missingCount_ >= CONFIRM_SAMPLES) {
-          noteLifted(now);
-        }
-      } else {
-        missingCount_ = 0;
-        if (++presentCount_ >= CONFIRM_SAMPLES) {
-          missing_ = false;
-          bootReady_ = true;
-          presentCount_ = 0;
-          missingCount_ = 0;
-        }
-      }
-      return;
-    }
-
-    if (!missing_) {
-      if (grams < MISSING_GRAMS) {
-        presentCount_ = 0;
-        if (++missingCount_ >= CONFIRM_SAMPLES) {
-          noteLifted(now);
-        }
-      } else {
-        missingCount_ = 0;
-      }
-      return;
-    }
-
-    if (grams > PRESENT_GRAMS) {
-      missingCount_ = 0;
-      if (++presentCount_ >= CONFIRM_SAMPLES) {
-        noteReturned(now);
-      }
-    } else {
-      presentCount_ = 0;
-    }
-  }
-
-  void noteLifted(uint32_t now) {
-    missing_ = true;
-    missingMs_ = now;
-    missingAlert_ = false;
-    stabilizing_ = false;
-    missingCount_ = 0;
-    presentCount_ = 0;
-    bootReady_ = true;
-    if (drinkAlert_) {
-      resumeAlert_ = true;
-      drinkAlert_ = false;
-    }
-    drinkFlashUntil_ = 0;
-    Serial.println("bottle lifted");
-  }
-
-  void noteReturned(uint32_t now) {
-    missing_ = false;
-    missingAlert_ = false;
-    stabilizing_ = true;
-    stabilizeMs_ = now;
-    missingCount_ = 0;
-    presentCount_ = 0;
-    bootReady_ = true;
-    Serial.println("bottle returned");
-  }
-
-  // After a put-down, weigh once. A real drink or refill ends the reminder.
-  // No change resumes it when the phone is here, and retries soon if the ping
-  // missed at that moment. The resume flag survives an away reading while lifted.
-  void settleReturn(uint32_t now, WeighResult result, bool quiet, PhoneCheck phoneCheck) {
-    if (result == WeighResult::Drink || result == WeighResult::Refill || result == WeighResult::NewBaseline) {
-      resumeAlert_ = false;
-      return;
-    }
-    if (!resumeAlert_ || result != WeighResult::NoChange) {
-      return;
-    }
-    const PhoneProbe phone = checkPhone(now, phoneCheck);
-    if (!quiet && phone == PhoneProbe::Allow) {
-      startAlert(now);
-      resumeAlert_ = false;
-      Serial.println("reminder resumed");
-      return;
-    }
-    if (!quiet) {
-      nextCheckMs_ = now + 1000;
-    }
-  }
-
-  WeighResult weigh(Scale &scale, BottleNvm &nvm) {
-    float grams = 0.0f;
-    if (!confirm(scale, nvm, &grams)) {
-      nextCheckMs_ = millis() + UNREADABLE_RETRY_MS;
-      Serial.println("weight unreadable, retry in 5s");
-      return WeighResult::Unreadable;
-    }
-    if (!hasBaseline_) {
-      if (grams < PRESENT_GRAMS) {
-        nextCheckMs_ = millis() + 1000;
-        return WeighResult::Waiting;
-      }
-      adopt(nvm, grams);
-      nextCheckMs_ = millis() + intervalMs(nvm);
-      Serial.print("baseline set ");
-      Serial.println(baseline_, 1);
-      return WeighResult::NewBaseline;
-    }
-
-    const float diff = baseline_ - grams;
-    Serial.print("baseline ");
-    Serial.print(baseline_, 1);
-    Serial.print(" now ");
-    Serial.print(grams, 1);
-    Serial.print(" diff ");
-    Serial.println(diff, 1);
-
-    if (diff >= DRINK_GRAMS) {
-      dailyMl_ += diff;
-      lastDrinkMl_ = diff;
-      hasLastDrink_ = true;
-      adopt(nvm, grams);
-      nvm.saveTotals(dailyMl_, lastDay_);
-      drinkAlert_ = false;
-      resumeAlert_ = false;
-      nextCheckMs_ = millis() + intervalMs(nvm);
-      drinkFlashUntil_ = millis() + DRINK_FLASH_MS;
-      Serial.print("drink ");
-      Serial.print(diff, 1);
-      Serial.print(" ml, today ");
-      Serial.println(dailyMl_, 1);
-      return WeighResult::Drink;
-    }
-    if (diff <= -REFILL_GRAMS) {
-      adopt(nvm, grams);
-      drinkAlert_ = false;
-      resumeAlert_ = false;
-      nextCheckMs_ = millis() + intervalMs(nvm);
-      Serial.println("refill, baseline moved");
-      return WeighResult::Refill;
-    }
-    nextCheckMs_ = millis() + intervalMs(nvm);
-    return WeighResult::NoChange;
-  }
-
-  bool confirm(Scale &scale, BottleNvm &nvm, float *grams) {
-    float first = 0.0f;
-    float second = 0.0f;
-    if (!scale.waitGrams(nvm.data, &first, 300, pump_)) {
-      return false;
-    }
-    pause(CONFIRM_GAP_MS);
-    if (!scale.waitGrams(nvm.data, &second, 300, pump_)) {
-      return false;
-    }
-    if (fabsf(first - second) <= CONFIRM_DRIFT_GRAMS) {
-      *grams = (first + second) * 0.5f;
-      return true;
-    }
-    pause(CONFIRM_GAP_MS);
-    float third = 0.0f;
-    if (!scale.waitGrams(nvm.data, &third, 300, pump_)) {
-      return false;
-    }
-    *grams = median(first, second, third);
-    return true;
-  }
-
-  void adopt(BottleNvm &nvm, float grams) {
-    baseline_ = grams;
-    hasBaseline_ = true;
-    nvm.saveBaseline(grams);
-  }
-
-  void startAlert(uint32_t now) {
-    drinkAlert_ = true;
-    alertMs_ = now;
-    blinkMs_ = now;
-    blinkOn_ = false;
-    Serial.println("reminder");
-  }
-
-  void rollDay(const Clock &clock, BottleNvm &nvm) {
-    if (!clock.valid || clock.day == lastDay_) {
-      return;
-    }
-    if (lastDay_ != 0) {
-      dailyMl_ = 0.0f;
-      Serial.println("new day, total cleared");
-    }
-    lastDay_ = clock.day;
-    nvm.saveTotals(dailyMl_, lastDay_);
-  }
-
-  void paint(uint32_t now, const BottleNvm &nvm, Outputs &out, bool quiet) {
-    const bool beepAllowed = !nvm.data.dnd && !quiet;
-    if (missing_ && missingAlert_) {
-      const bool on = blink(now);
-      const bool beep = beepAllowed && !on && now - alertMs_ >= BEEP_DELAY_MS;
-      if (on) {
-        out.show(MISSING_COLOR_R, MISSING_COLOR_G, MISSING_COLOR_B, true, beep, nvm.data.beepType);
-      } else {
-        out.show(0, 0, 0, false, beep, nvm.data.beepType);
-      }
-      return;
-    }
-
-    if (!missing_ && (int32_t)(drinkFlashUntil_ - now) > 0) {
-      out.show(DRINK_OK_R, DRINK_OK_G, DRINK_OK_B, false, false, nvm.data.beepType);
-      return;
-    }
-
-    if (stabilizing_) {
-      out.show(quiet ? QUIET_R : nvm.data.colorR, quiet ? QUIET_G : nvm.data.colorG,
-               quiet ? QUIET_B : nvm.data.colorB, false, false, nvm.data.beepType);
-      return;
-    }
-
-    if (drinkAlert_ && !quiet) {
-      const bool on = blink(now);
-      const bool beep = beepAllowed && !on && now - alertMs_ >= BEEP_DELAY_MS;
-      if (on) {
-        out.show(ALERT_R, ALERT_G, ALERT_B, true, beep, nvm.data.beepType);
-      } else {
-        out.show(0, 0, 0, false, beep, nvm.data.beepType);
-      }
-      return;
-    }
-
-    out.show(quiet ? QUIET_R : nvm.data.colorR, quiet ? QUIET_G : nvm.data.colorG,
-             quiet ? QUIET_B : nvm.data.colorB, false, false, nvm.data.beepType);
-  }
-
-  bool blink(uint32_t now) {
-    if (now - blinkMs_ >= BLINK_MS) {
-      blinkMs_ = now;
-      blinkOn_ = !blinkOn_;
-    }
-    return blinkOn_;
-  }
-
-  PhoneProbe checkPhone(uint32_t now, PhoneCheck phoneCheck) {
-    if (phoneCheck == nullptr) {
-      return PhoneProbe::Allow;
-    }
-    if ((int32_t)(now - probeBusyUntil_) < 0) {
-      return PhoneProbe::Busy;
-    }
-    const PhoneProbe result = phoneCheck();
-    if (result == PhoneProbe::Busy) {
-      probeBusyUntil_ = now + 1000;
-    }
-    return result;
-  }
-
-  uint32_t intervalMs(const BottleNvm &nvm) const {
-    if (testIntervalSec_ > 0) {
-      return (uint32_t)testIntervalSec_ * 1000UL;
-    }
-    const uint16_t minutes = nvm.data.intervalMin == 0 ? 30 : nvm.data.intervalMin;
-    return (uint32_t)minutes * 60000UL;
-  }
-
-  static bool inQuiet(const BottleNvmData &nvm, const Clock &clock) {
-    if (!clock.valid || nvm.startMin == nvm.endMin) {
-      return false;
-    }
-    const uint16_t nowMin = (uint16_t)(clock.hour * 60 + clock.minute);
-    if (nvm.startMin < nvm.endMin) {
-      return nowMin >= nvm.startMin && nowMin < nvm.endMin;
-    }
-    return nowMin >= nvm.startMin || nowMin < nvm.endMin;
-  }
-
-  static float median(float a, float b, float c) {
-    if ((a <= b && b <= c) || (c <= b && b <= a)) {
-      return b;
-    }
-    if ((b <= a && a <= c) || (c <= a && a <= b)) {
-      return a;
-    }
-    return c;
+  bool persist(uint32_t now, BottleNvm &nvm) {
+    if (!engine_.persistenceDirty()) return true;
+    if (attemptedPersist_ && now - lastPersistAttemptMs_ < UNREADABLE_RETRY_MS) return false;
+    attemptedPersist_ = true; lastPersistAttemptMs_ = now;
+    const bool ok = nvm.saveHydration(engine_.hasBaseline(), engine_.baseline(), engine_.dailyMl(), engine_.lastDay());
+    persistenceFailed_ = !ok;
+    if (ok) { engine_.persisted(); attemptedPersist_ = false; }
+    return ok;
   }
 };

@@ -1,114 +1,90 @@
-# water_bottle_reminder_v2
+# Bottle — standalone hydration reminder
 
-A smart water-bottle base that notices when you drink, reminds you when you have not, and stays quiet when you are away or it is quiet hours.
+An ESP32-powered bottle base that helps people remember to drink while working. A load cell detects lifting, drinks and refills; an RGB LED, white LED and active buzzer provide local reminders. No Raspberry Pi, cloud account or ESP-NOW network is required.
 
-The running firmware is the Arduino sketch in `bottle/`. It runs on an ESP32-C3 Super Mini. The bottle sits on a load cell. The base weighs it, talks to one paired phone over Bluetooth, and serves a setup page on your home Wi-Fi.
+**Current development target: ESP32-WROOM (classic ESP32), not the C3 Super Mini.** The Flutter app replaces the old web portal. This is a prototype being hardened, not a production-certified product.
 
-This is a standalone bottle. It does not use the older house-automation ESP-NOW link to a Raspberry Pi. The drink rules follow that earlier `hydration_v3` design: the same thresholds, the same lift and return behavior, and the same light and buzzer timing. Notifications stay on the bottle itself.
+## First-time setup
 
-## Objective
+1. Power the base and open the app (`bottle_tester/`). Scan for **bottle** and connect.
+2. Set your time zone. Use **Search networks** to select a nearby **2.4 GHz** network, then enter its password. A hidden/manual network option remains available. Alternatively, explicitly use the phone/computer clock as a fallback. Saved networks are used for internet time at cold boot. Network attempts are bounded and do not prevent app connections.
+3. With the bottle removed, **zero the empty base**. Then place a known weight on it and calibrate. Never zero the base with the drinking bottle in place. Factory calibration is recommended for a sellable product.
+4. Choose your active hours and reminder interval (defaults: 10:00–23:00, every 30 minutes). Put the bottle on the base so it can learn a baseline.
+5. Choose colours, beep style and the missing-bottle timeout if desired. Settings live on the base, not just in the app.
 
-Help one person drink through the day without nagging them when they are not there.
+No reminder sounds until the scale is calibrated, the clock is valid and the active time window is open. DND mutes sound; it does not disable alert lights. Equal start/end times disable reminders. Overnight windows are supported.
 
-- Learn how heavy the bottle is, then treat a real drop in weight as a drink and a real rise as a refill.
-- Remind with light first, then sound, only while the bottle is on the base and the paired phone is still around.
-- Stop the moment the bottle is picked up, a drink or refill is confirmed, quiet hours start, Do Not Disturb is on, or the phone leaves.
-- Let the owner set color, quiet hours, reminder interval, beep style, and Wi-Fi from a phone on the same network, without joining a setup hotspot every time.
+## Drinking behavior
+
+- Less than 100 g for three samples means lifted. A lift stops an alert; the missing-bottle timer begins.
+- Over 108 g means returned. Wait for the configured settling time (default 2 seconds), then confirm stable fresh readings.
+- At least 50 g lighter (configurable) counts as a drink, treating 1 g water as 1 ml. The LED flashes green and the next interval begins.
+- At least 100 g heavier counts as a refill, resets the baseline and restarts the interval without adding intake.
+- Smaller sips accumulate against the baseline. Returning without drinking resumes an interrupted reminder.
+- No reduction at an interval starts a light reminder. The buzzer begins after the configured light-only delay (default 5 seconds).
+- A bottle missing for the configured duration (default 3 minutes) gets a separate-colour alert. Returning clears it.
+- Quiet hours, disabled presence, stale/faulted scale data and manual scale measurement must never leave a buzzer latched on.
+
+Totals reset on the next valid local day. Weight differences are estimates, not medical or nutritional measurements: pouring water out looks like drinking, and drinking then refilling before replacement can hide intake.
+
+## Presence: important phone limitation
+
+The peer BLE address is automatically saved on app connection and replaced by the next connected app, as requested for this prototype. It is visible in diagnostics. **A stored MAC is not reliable passive phone presence:** iOS/Android rotate private addresses and usually do not accept incoming BLE connections.
+
+Optional presence gating therefore uses the actual app connection, with 60 seconds of disconnect grace and no pretend boot presence. Leave the app connected for this mode. Mobile background execution/reconnection depends on OS policy and needs device-specific testing. Presence gating is **off by default** so closing the app does not silently stop water reminders. It is not evidence that the person is physically at home (a stationary laptop can stay connected).
 
 ## Hardware
 
-| Part | Connection |
+| Component | ESP32-WROOM GPIO |
 | --- | --- |
-| ESP32-C3 Super Mini | USB serial at 115200 |
-| HX711, 10 kg load cell | DT GPIO4, SCK GPIO3 |
-| Common-anode RGB LED, 3.3 V | R GPIO5, G GPIO6, B GPIO7, pin LOW = on |
-| White LED | GPIO1, HIGH = on |
-| Active buzzer | GPIO10, HIGH = on |
+| HX711 DT / SCK | 32 / 33 |
+| Common-anode RGB R / G / B | 27 / 14 / 12 (LOW = lit) |
+| White LED | 25 (HIGH = lit) |
+| Active buzzer | 26 (HIGH = on) |
 
-GPIO2, GPIO8, and GPIO9 are left empty. Boot never writes a new zero by itself.
+Use suitable resistors and driver transistors for loads exceeding GPIO ratings. GPIO12 is a boot strap pin: validate external pull levels and boot reliability on the final PCB. Do not use this pin table for a C3. Early C3 test sketches are retained for reference.
 
-## How a drink is detected
+## Build and run
 
-Grams are `(raw − tare) / calibration`. The empty base is zeroed once with `t` or the page button. A known weight is calibrated with `c <grams>`.
+Firmware (Arduino CLI; ESP32 core 3.3.12 and ArduinoJson 7.4.3 used during development):
 
-The base waits 1.5 seconds after boot, then needs 3 samples, 120 ms apart, before it believes a change.
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=115200 --output-dir .build/esp32 bottle
+arduino-cli upload --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,UploadSpeed=115200 --port /dev/cu.usbserial-0001 --input-dir .build/esp32 bottle
+```
 
-- **Lifted.** Weight stays under 100 g. The saved baseline is kept, except at boot: if the bottle is already missing, the baseline is cleared and learned again when the bottle comes back.
-- **Returned.** Weight stays over 108 g. The base waits 2 seconds for the water to settle.
-- **Confirmed weight.** Two readings 250 ms apart. If they agree within 5 g, their average is used. If they do not, a third reading is taken and the median is used.
-- **Drink.** The bottle is at least 50 g lighter than the baseline. That difference is added to today’s millilitres (1 g is treated as 1 ml). The baseline moves to the new weight. Any reminder stops, and the interval starts again.
-- **Refill.** The bottle is at least 100 g heavier. The baseline moves up. Today’s total does not increase. Any reminder stops, and the interval starts again.
-- **Put back without drinking.** The change is between those two limits. The baseline stays. If a reminder was already running when the bottle was lifted, it starts again after the 2 second settle. A small sip under 50 g is kept in the baseline until later sips add up.
+Use your actual serial port. Close serial monitors before uploading. **Do not erase all flash** when updating: it contains calibration and user settings. The bogde HX711 library is vendored under `bottle/src/` and must not be replaced by a different HX711 API.
 
-If the bottle is on the base at boot and the saved baseline is off by 100 g or more, the baseline is moved to the current weight without counting a drink.
+App:
 
-At midnight, once the clock is valid, today’s total resets.
+```sh
+export PATH="$HOME/flutter/bin:$PATH"
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+cd bottle_tester
+flutter pub get
+flutter test
+flutter run -d macos
+```
 
-## How you are notified
+The app is responsive at phone widths, but Android/iOS shipping, signing, permission flows and background BLE behavior require real-device testing. macOS needs Bluetooth permission.
 
-Nothing beeps during the first 5 seconds. The light blinks alone so the bottle can be picked up quietly. After that, the buzzer follows the saved beep style unless Do Not Disturb or quiet hours are on.
+## Architecture and diagnostics
 
-| State | Light | Sound |
-| --- | --- | --- |
-| Idle, daytime | Solid color chosen on the page (default purple) | Off |
-| Quiet hours | Solid blue | Off |
-| Drink reminder | Cyan and white LED, blinking every 500 ms | After 5 seconds, on the off-beat of the blink |
-| Bottle missing for 3 minutes | Red and white LED, same blink | After 5 seconds, same beep rules |
+- `bottle/bottle.ino`: single-owner cooperative main loop, JSON command validation, snapshots and diagnostics.
+- `bottle/BottleBle.h`: callback-to-loop queues and MTU-safe newline framing. No sensor/flash work in callbacks.
+- `bottle/Hydration.h`, `bottle/HydrationEngine.h`: hardware adapter and deterministic state machine.
+- `bottle/Scale.h`: fresh raw readings and cooperative tare/calibration sampling.
+- `bottle/BottleNvm.h`: validated settings, calibration, networks, baseline and daily totals.
+- `bottle/BootWifiTime.h`: bounded asynchronous Wi-Fi/NTP, then radio shutoff for Wi-Fi.
+- `bottle/ClockService.h`: fixed-offset time zone and active-window logic. Fixed offsets do not automatically follow daylight saving; resync the zone when traveling/DST changes.
+- `bottle/PhonePresence.h`: nonblocking connection/grace policy.
+- `bottle_tester/`: guided Flutter companion app and diagnostics.
+- `tests/`, `tools/`: host state-machine tests and serial/BLE hardware regression tools.
 
-Beep styles are Off, Single, Beep beep, and Long. Beep beep is two short chirps. The buzzer sounds while the LEDs are off so the 3.3 V rail is not driving both at full strength.
+[Protocol v2](docs/PROTOCOL.md) defines JSON commands over both serial (115200) and BLE. Firmware and app must be updated together; the previous text-only test protocol is incompatible. Diagnostics expose effective values and whether they were saved. Defaults are valid, not failures. Passwords and identity keys are never returned by diagnostics.
 
-The drink reminder starts when the bottle has been on the base, the interval has passed (default 30 minutes, set from the page, 1–240), it is not quiet hours, and the phone check allows it. The missing alert starts only after the bottle has been off the base for 3 minutes.
+[Hardware test guide](docs/HARDWARE_TESTING.md) separates software checks from physical lift/drink/beep verification. See `docs/TEST_RESULTS.md` for the recorded validation of this development pass when available.
 
-## When the notification stops
+## Before selling
 
-- The bottle is lifted.
-- A drink of at least 50 g, or a refill of at least 100 g, is confirmed.
-- The bottle is put back after a missing alert.
-- The paired phone is no longer here. Reminders turn off, and the missing timer does not run while you are away.
-- Quiet hours begin. The default window is 23:00–10:00 and can be changed on the page.
-- Do Not Disturb is on. The light can still show the alert color. The buzzer stays off.
-- The scale is zeroed. The baseline and any active reminder are cleared.
-
-Until a phone has been paired, reminders are allowed without a presence check. After pairing, the bottle remembers that phone’s address and identity key. It checks presence by opening a short Bluetooth Low Energy connection to that address, trying a public address and then a random one. A reply means the phone is here. No reply for 10 seconds means away. For the first 10 seconds after startup, before any reply, the phone still counts as here.
-
-## Setup page
-
-With no saved Wi-Fi, the bottle opens an open network named `bottle` at `http://192.168.4.1/`. After a 2.4 GHz network is saved, it joins that network and the page is served on the address the router gives it, for example `http://192.168.1.3/`. The Mac or phone stays on the normal Wi-Fi, which still has internet. Up to four networks can be saved. At boot the bottle scans and joins the saved network it can hear. The setup network comes back only if the saved network does not connect, following the behavior chosen on the page.
-
-The page shows live weight, whether the bottle is on the base, today’s millilitres, and the last drink. It can zero the scale, search for a nearby phone, search for nearby 2.4 GHz networks, and save Do Not Disturb, light color, quiet hours, interval, beep style, and Wi-Fi. The ESP32-C3 only hears 2.4 GHz, not 5 GHz.
-
-The clock uses NTP after Wi-Fi connects. The time zone is the place chosen on the page (Kolkata, UTC+5:30, until you change it) and is stored on the bottle. Quiet hours and the midnight reset use that local time. Without a clock, both stay off and the bottle runs as daytime. The zone is a fixed offset, so it does not move itself for daylight saving.
-
-## Serial commands
-
-Open the USB port at 115200. Opening the port resets the ESP32-C3.
-
-| Command | Effect |
-| --- | --- |
-| `t` | Zero the empty base and clear the baseline |
-| `c <grams>` | Calibrate from a known weight after zeroing |
-| `w` | Print the weight now |
-| `p` | Advertise as Bottle so a phone can pair |
-| `b` | Search nearby Bluetooth names. `b ultra` filters by name |
-| `s <number>` | Save a phone from the last search |
-| `n` | Scan 2.4 GHz Wi-Fi |
-| `j <ssid>\|<password>` | Save a network and join it |
-| `r <ssid>` | Forget one saved network |
-| `a` | Print the same status JSON the page uses |
-| `h` | Print this list |
-
-## Layout
-
-| Path | Role |
-| --- | --- |
-| `bottle/bottle.ino` | Boot, serial commands, Bluetooth pairing and presence |
-| `bottle/Hydration.h` | Drink, refill, reminder, and quiet-hours state machine |
-| `bottle/Outputs.h` | RGB, white LED, and buzzer |
-| `bottle/Scale.h` | HX711 reads, tare, and calibration |
-| `bottle/Portal.h` | Wi-Fi, setup access point, and the web server |
-| `bottle/WebPage.h` | The setup page |
-| `bottle/BottleNvm.h` | Saved zero, calibration, baseline, totals, phone, and Wi-Fi |
-| `bottle/Config.h` | Pins and the drink thresholds |
-| `bringup_test/`, `hx711_test/`, `rgb_touch_test/` | Early hardware checks, not the product firmware |
-
-Build the `bottle` sketch with the ESP32 Arduino core for `nologo_esp32c3_super_mini` and `PartitionScheme=huge_app`.
+This prototype allows a nearby BLE client to connect, change settings and replace the saved peer; it does **not** implement secure ownership. Before public deployment add a physical pairing/reset action, authenticated encrypted provisioning/ownership, flash/NVS encryption as appropriate, firmware signing and a recovery/update path. Test power loss during writes, long-running sensor drift, temperature compensation, strap-pin behavior, electrical limits, enclosure strain, reconnection, accessibility, radio compliance and mobile lifecycle behavior. Do not market it as a medical device or as production-ready based on simulation tests alone.

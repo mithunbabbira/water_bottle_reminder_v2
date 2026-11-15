@@ -1,921 +1,345 @@
-// Scale plus boot checks. Serial 115200.
-// t = save the empty base as zero
-// c 400 = the object on the scale weighs 400 g
-// w = print the weight now
-// p = advertise as Bottle so the phone can pair once
-// Boot prints weight, zero, calibration, phone, Wi-Fi, time, and the from–until window.
-// It does not write a new zero, open a setup network, or start reminders.
-
+// Standalone ESP32-WROOM hydration reminder. Protocol: docs/PROTOCOL.md.
+// Hardware access, flash writes and commands are owned solely by loop().
+#include <ArduinoJson.h>
+#include "JsonValidation.h"
+#include "BootWifiTime.h"
+#include "BottleBle.h"
+#include "Hydration.h"
 #include "PhonePresence.h"
-#include "Portal.h"
-#include "Scale.h"
-
-#include <BLEAdvertisedDevice.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLESecurity.h>
-#include <BLEServer.h>
-#include <WiFi.h>
-#include <host/ble_store.h>
-#include <mbedtls/aes.h>
-
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
+#include "WifiDiscovery.h"
 
 BottleNvm nvm;
 Scale scale;
 Outputs outputs;
 Hydration hydration;
-Clock wallClock;
-Portal portal;
-
-char line[128];
-uint8_t lineLen = 0;
-uint32_t lastPrintMs = 0;
-
-struct Heard {
-  char name[25];
-  char mac[18];
-  int rssi;
-};
-Heard heard[8];
-int heardCount = 0;
-
-bool pairing = false;
-uint32_t pairingMs = 0;
-static const uint32_t PAIRING_WINDOW_MS = 120000;
-bool serverReady = false;
-
-struct PairResult {
-  int status;
-  bool hasIrk;
-  bool hasMac;
-  bool sameSaved;
-  bool replaced;
-  uint8_t irk[16];
-  uint8_t mac[6];
-};
-PairResult pairResult;
-volatile bool pairReady = false;
-volatile bool phoneConnected = false;
-volatile unsigned dropCount = 0;
-volatile uint32_t phoneSeenMs = 0;
-volatile bool phoneEverSeen = false;
-
-static const uint32_t WEIGHT_WAIT_MS = 2000;
-static const uint32_t BLE_AFTER_WIFI_MS = 25000;
-bool bleStarted = false;
-uint32_t bleAfterMs = 0;
-
+ClockService clockSvc;
+BootWifiTime wifiTime;
+WifiDiscovery discovery;
+BottleBle ble;
 PhonePresence presence;
+bool ready = false, bleReady = false;
+uint32_t lastStatusMs = 0;
+String serialLine;
+bool serialDiscard = false;
+int maintenanceId = 0;
+bool maintenanceTare = false;
+uint32_t maintenanceSession = 0;
+bool maintenanceBle = false;
+bool replyBle = false;
 
-bool parseMac(const char *text, uint8_t out[6]) {
-  unsigned int b[6];
-  if (sscanf(text, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
-    return false;
+void sendJson(const JsonDocument &doc, bool toBle = true) {
+  String line;
+  serializeJson(doc, line);
+  Serial.println(line);
+  if (toBle && bleReady && !ble.send(line)) Serial.println("{\"type\":\"error\",\"error\":\"BLE output queue full\"}");
+}
+void ack(int id, bool ok, const char *error = "") {
+  JsonDocument d;
+  d["type"] = "ack"; d["id"] = id; d["ok"] = ok;
+  if (!ok) d["error"] = error;
+  sendJson(d,replyBle);
+}
+void settingsJson(JsonObject s) {
+  const auto &v = nvm.data;
+  s["start_min"] = v.startMin; s["end_min"] = v.endMin;
+  s["interval_min"] = v.intervalMin; s["beep_type"] = v.beepType; s["dnd"] = v.dnd;
+  s["tz_min"] = v.tzMin;
+  s["color"] = (uint32_t(v.colorR) << 16) | (uint32_t(v.colorG) << 8) | v.colorB;
+  s["reminder_color"] = v.reminderColor; s["missing_color"] = v.missingColor;
+  s["missing_sec"] = v.missingSec; s["beep_delay_sec"] = v.beepDelaySec;
+  s["drink_grams"] = v.drinkGrams; s["settle_ms"] = v.settleMs;
+  s["presence_enabled"] = v.presenceEnabled;
+}
+String phoneMac() {
+  if (!nvm.data.hasBleMac) return "";
+  char mac[18];
+  snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", nvm.data.bleMac[0], nvm.data.bleMac[1],
+           nvm.data.bleMac[2], nvm.data.bleMac[3], nvm.data.bleMac[4], nvm.data.bleMac[5]);
+  return String(mac);
+}
+void status() {
+  JsonDocument d;
+  d["type"] = "status"; d["protocol"] = 2; d["firmware"] = "2.0.0"; d["ready"] = ready;
+  d["clock_valid"] = clockSvc.valid(); d["time_source"] = wifiTime.source();
+  d["epoch"] = (int64_t)time(nullptr); d["tz_min"] = nvm.data.tzMin;
+  d["active"] = ClockService::inActiveWindow(nvm.data, clockSvc.clock());
+  int32_t raw; float grams;
+  const bool haveRaw = scale.latestRaw(&raw, 1000);
+  if (haveRaw) d["raw"] = raw; else d["raw"] = nullptr;
+  const bool haveGrams = scale.latestGrams(&grams, SAMPLE_MAX_AGE_MS);
+  if (haveGrams) d["weight_g"] = grams; else d["weight_g"] = nullptr;
+  d["scale_state"] = scale.busy() ? "measuring" : !haveRaw ? "no_data" : scale.fault() ? "fault" :
+                     !nvm.data.hasTare ? "need_tare" : !nvm.data.hasCal ? "need_cal" : "ready";
+  d["state"] = scale.busy() ? "settling" : hydration.stateName();
+  if (hydration.hasBaseline()) d["baseline_g"] = hydration.baseline(); else d["baseline_g"] = nullptr;
+  d["today_ml"] = hydration.dailyMl(); d["last_drink_ml"] = hydration.lastDrinkMl();
+  d["next_check_sec"] = hydration.nextCheckSeconds(millis());
+  d["phone_connected"] = bleReady && ble.connected(); d["phone_present"] = presence.here(millis());
+  if (nvm.data.hasBleMac) d["phone_mac"] = phoneMac(); else d["phone_mac"] = nullptr;
+  d["wifi_scan_state"] = discovery.state();
+  d["wifi_state"] = wifiTime.state(); d["wifi_error"] = wifiTime.error(); d["wifi_ssid"] = wifiTime.ssid();
+  settingsJson(d["settings"].to<JsonObject>());
+  auto networks = d["networks"].to<JsonArray>();
+  for (uint8_t i = 0; i < nvm.data.netCount; ++i) {
+    auto net = networks.add<JsonObject>(); net["ssid"] = nvm.data.nets[i].ssid;
+    net["secured"] = nvm.data.nets[i].pass[0] != 0;
   }
-  for (int i = 0; i < 6; i++) {
-    if (b[i] > 255) {
-      return false;
-    }
-    out[i] = (uint8_t)b[i];
+  d["storage_fault"] = hydration.storageFault(); d["storage_pending"] = hydration.persistencePending();
+  d["uptime_sec"] = millis() / 1000; d["free_heap"] = ESP.getFreeHeap();
+  sendJson(d); lastStatusMs = millis();
+}
+void event(const char *name, float ml = 0) {
+  JsonDocument d; d["type"] = "event"; d["name"] = name; d["ml"] = ml; sendJson(d);
+}
+
+// Dump incrementally: no delay(), no lost scale samples, no passwords.
+int dumpId = 0, dumpIndex = -1;
+bool dumpBle = false;
+JsonDocument dump;
+void beginDump(int id) {
+  dump.clear();
+  auto &v = nvm.data;
+  auto put = [&](const char *key, JsonVariantConst value, bool stored) {
+    auto e = dump[key].to<JsonObject>(); e["value"] = value; e["stored"] = stored;
+  };
+  auto scalar = [&](const char *key, auto value, bool stored) {
+    JsonDocument temp; temp.set(value); put(key, temp.as<JsonVariantConst>(), stored);
+  };
+  scalar("schema", BOTTLE_SCHEMA_VER, nvm.stored("schema"));
+  scalar("tare_offset", v.tareOffset, v.hasTare); scalar("cal_factor", v.calFactor, v.hasCal);
+  if (v.hasBaseline) scalar("baseline_weight", v.baselineWeight, true);
+  else { JsonDocument nullDoc; put("baseline_weight", nullDoc.as<JsonVariantConst>(), false); }
+  scalar("daily_total", v.dailyTotalMl, nvm.stored("daily_total"));
+  scalar("last_day", v.lastDay, nvm.stored("last_day"));
+  scalar("ble_mac", phoneMac(), v.hasBleMac); scalar("ble_irk", v.hasIrk ? "set" : "empty", v.hasIrk);
+  JsonDocument s; settingsJson(s.to<JsonObject>());
+  for (JsonPair p : s.as<JsonObject>()) put(p.key().c_str(), p.value(), nvm.settingStored(p.key().c_str()));
+  scalar("net_count", v.netCount, nvm.stored("net_count"));
+  scalar("sta_ssid", v.staSsid, nvm.stored("sta_ssid"));
+  scalar("sta_pass", v.staPass[0] ? "set" : "empty", nvm.stored("sta_pass"));
+  for (uint8_t i = 0; i < BOTTLE_MAX_NETWORKS; ++i) {
+    char sk[12], pk[12]; snprintf(sk, sizeof(sk), "wifi_s%u", i); snprintf(pk, sizeof(pk), "wifi_p%u", i);
+    scalar(sk, i < v.netCount ? v.nets[i].ssid : "", i < v.netCount);
+    scalar(pk, i < v.netCount && v.nets[i].pass[0] ? "set" : "empty", i < v.netCount);
   }
+  scalar("ap_ssid", v.apSsid, nvm.stored("ap_ssid"));
+  scalar("ap_pass", v.apPass[0] ? "set" : "empty", nvm.stored("ap_pass"));
+  scalar("ap_behavior", v.apBehavior, nvm.stored("ap_behavior"));
+  dumpId = id; dumpIndex = 0; dumpBle = replyBle;
+  JsonDocument start; start["type"] = "nvs.begin"; start["id"] = id; sendJson(start,dumpBle);
+}
+void tickDump() {
+  if (dumpIndex < 0 || !ble.txIdle()) return;
+  int i = 0;
+  for (JsonPair p : dump.as<JsonObject>()) {
+    if (i++ != dumpIndex) continue;
+    JsonDocument d; d["type"] = "nvs.entry"; d["id"] = dumpId; d["key"] = p.key();
+    d["value"] = p.value()["value"]; d["stored"] = p.value()["stored"];
+    sendJson(d,dumpBle); ++dumpIndex; return;
+  }
+  JsonDocument end; end["type"] = "nvs.end"; end["id"] = dumpId; sendJson(end,dumpBle);
+  dumpIndex = -1; dump.clear();
+}
+
+bool settingsCommand(JsonObjectConst args) {
+  BottleNvmData v = nvm.data;
+  static const char *allowed[] = {"id","cmd","start_min","end_min","interval_min","beep_type","dnd",
+    "tz_min","color","reminder_color","missing_color","missing_sec","beep_delay_sec","drink_grams",
+    "settle_ms","presence_enabled"};
+  for (JsonPairConst p : args) {
+    bool known = false;
+    for (const char *key : allowed) if (!strcmp(p.key().c_str(),key)) known = true;
+    if (!known || p.value().isNull()) return false;
+  }
+  // Validate before narrowing integers (and reject wrong JSON types).
+  auto number = [&](const char *key, double lo, double hi, bool integral = true) {
+    if (args[key].isNull()) return true;
+    if (!args[key].is<double>() || args[key].is<bool>()) return false;
+    const double n = args[key].as<double>();
+    return isfinite(n) && n >= lo && n <= hi && (!integral || floor(n) == n);
+  };
+  if (!number("start_min",0,1439) || !number("end_min",0,1439) || !number("interval_min",1,240) ||
+      !number("beep_type",0,3) || !number("tz_min",-720,840) || !number("color",0,16777215) ||
+      !number("reminder_color",0,16777215) || !number("missing_color",0,16777215) ||
+      !number("missing_sec",10,3600) || !number("beep_delay_sec",0,30) ||
+      !number("drink_grams",5,500) || !number("settle_ms",500,5000)) return false;
+  if ((!args["dnd"].isNull() && !args["dnd"].is<bool>()) ||
+      (!args["presence_enabled"].isNull() && !args["presence_enabled"].is<bool>())) return false;
+#define APPLY(key,field) if (!args[key].isNull()) v.field = args[key].as<decltype(v.field)>();
+  APPLY("start_min",startMin) APPLY("end_min",endMin) APPLY("interval_min",intervalMin)
+  APPLY("beep_type",beepType) APPLY("dnd",dnd) APPLY("tz_min",tzMin)
+  APPLY("reminder_color",reminderColor) APPLY("missing_color",missingColor)
+  APPLY("missing_sec",missingSec) APPLY("beep_delay_sec",beepDelaySec)
+  APPLY("drink_grams",drinkGrams) APPLY("settle_ms",settleMs) APPLY("presence_enabled",presenceEnabled)
+#undef APPLY
+  if (v.tzMin % 15) return false;
+  if (!args["color"].isNull()) {
+    const uint32_t c = args["color"].as<uint32_t>(); v.colorR = c >> 16; v.colorG = c >> 8; v.colorB = c;
+  }
+  const bool resetInterval = v.intervalMin != nvm.data.intervalMin;
+  if (!nvm.saveSettings(v)) return false;
+  clockSvc.setTz(v.tzMin);
+  if (resetInterval) hydration.useSavedInterval(nvm);
   return true;
 }
-
-class NameScan : public BLEAdvertisedDeviceCallbacks {
- public:
-  void onResult(BLEAdvertisedDevice advertisedDevice) override { (void)advertisedDevice; }
-};
-
-bool addressEmpty(const ble_addr_t &addr) {
-  for (int i = 0; i < 6; i++) {
-    if (addr.val[i] != 0) {
-      return false;
-    }
+void processCommand(const char *text, bool fromBle = false) {
+  replyBle = fromBle;
+  JsonDocument d;
+  auto err = deserializeJson(d, text);
+  if (err || !singleJsonObject(text) || !validJsonStrings(d.as<JsonVariantConst>()) ||
+      !d.is<JsonObject>() || !d["id"].is<int>() || !d["cmd"].is<const char *>()) {
+    ack(0,false,"Expected newline-delimited JSON with integer id and cmd."); return;
   }
-  return true;
-}
-
-void copyPrintedMac(const ble_addr_t &addr, uint8_t out[6]) {
-  for (int i = 0; i < 6; i++) {
-    out[i] = addr.val[5 - i];
-  }
-}
-
-void forgetPeer(const uint8_t printed[6]) {
-  ble_addr_t addr;
-  memset(&addr, 0, sizeof(addr));
-  for (int i = 0; i < 6; i++) {
-    addr.val[i] = printed[5 - i];
-  }
-  addr.type = BLE_ADDR_PUBLIC;
-  ble_store_util_delete_peer(&addr);
-  addr.type = BLE_ADDR_RANDOM;
-  ble_store_util_delete_peer(&addr);
-}
-
-bool isSavedPhone(const uint8_t mac[6]) {
-  return nvm.data.hasBleMac && memcmp(mac, nvm.data.bleMac, 6) == 0;
-}
-
-class PairCallbacks : public BLESecurityCallbacks {
- public:
-  void onAuthenticationComplete(ble_gap_conn_desc *desc, int status) override {
-    pairResult.status = status;
-    pairResult.hasIrk = false;
-    pairResult.hasMac = false;
-    pairResult.sameSaved = false;
-    pairResult.replaced = false;
-    if (desc != nullptr) {
-      ble_addr_t id = desc->peer_id_addr;
-      if (addressEmpty(id)) {
-        id = desc->peer_ota_addr;
+  const int id = d["id"]; const char *cmd = d["cmd"];
+  if (!strcmp(cmd,"status")) { ack(id,true); status(); return; }
+  if (!ready) { ack(id,false,"Storage unavailable. Restart the bottle."); return; }
+  if (scale.busy()) { ack(id,false,"Scale measurement in progress. Please wait."); return; }
+  if (!strcmp(cmd,"settings")) {
+    if (!settingsCommand(d.as<JsonObjectConst>())) { ack(id,false,"Invalid settings or flash save failed."); return; }
+  } else if (!strcmp(cmd,"nvs")) {
+    if (dumpIndex >= 0) { ack(id,false,"Diagnostics already in progress."); return; }
+    ack(id,true); beginDump(id); return;
+  } else if (!strcmp(cmd,"wifi.scan")) {
+    if (wifiTime.busy() || discovery.busy()) { ack(id,false,"Wi-Fi is busy. Wait for the current check to finish."); return; }
+    discovery.start(id,fromBle,ble.session());
+  } else if (!strcmp(cmd,"wifi.add") || !strcmp(cmd,"wifi.remove")) {
+    if (wifiTime.busy() || discovery.busy()) { ack(id,false,"Wi-Fi check in progress. Please wait."); return; }
+    if (!d["ssid"].is<const char *>() || !strlen(d["ssid"])) { ack(id,false,"Enter a Wi-Fi network name."); return; }
+    const char *ssid = d["ssid"];
+    if (!strcmp(cmd,"wifi.add")) {
+      if (!d["password"].is<const char *>() || !nvm.saveNet(ssid,d["password"])) {
+        ack(id,false,"Could not save. Use a 1–32 byte name, empty or 8–63 byte password, max four networks."); return;
       }
-      if (!addressEmpty(id)) {
-        copyPrintedMac(id, pairResult.mac);
-        pairResult.hasMac = true;
-        pairResult.sameSaved = isSavedPhone(pairResult.mac);
-      }
-      if (status == 0) {
-        struct ble_store_key_sec key;
-        struct ble_store_value_sec value;
-        memset(&key, 0, sizeof(key));
-        key.peer_addr = desc->peer_id_addr;
-        int rc = ble_store_read_peer_sec(&key, &value);
-        if (rc != 0 || !value.irk_present) {
-          memset(&key, 0, sizeof(key));
-          key.peer_addr = desc->peer_ota_addr;
-          rc = ble_store_read_peer_sec(&key, &value);
-        }
-        if (rc == 0 && value.irk_present) {
-          memcpy(pairResult.irk, value.irk, sizeof(pairResult.irk));
-          pairResult.hasIrk = true;
-          if (nvm.data.hasBleMac && !pairResult.sameSaved) {
-            forgetPeer(nvm.data.bleMac);
-            pairResult.replaced = true;
-          }
-        } else if (pairResult.hasMac && !pairResult.sameSaved) {
-          forgetPeer(pairResult.mac);
-        }
-      } else if (pairResult.hasMac && !pairResult.sameSaved) {
-        forgetPeer(pairResult.mac);
-      }
+      wifiTime.start(nvm);
+    } else if (!nvm.removeNet(ssid)) { ack(id,false,"Network not found or flash save failed."); return; }
+  } else if (!strcmp(cmd,"wifi.sync")) {
+    if (discovery.busy() || !wifiTime.start(nvm)) { ack(id,false,"Already checking Wi-Fi, or no saved networks."); return; }
+  } else if (!strcmp(cmd,"time.set")) {
+    if (!d["epoch"].is<int64_t>() || d["epoch"].as<int64_t>() < 1700000000LL || d["epoch"].as<int64_t>() > 4102444800LL) {
+      ack(id,false,"Invalid UTC time."); return;
     }
-    __sync_synchronize();
-    pairReady = true;
-  }
-};
-
-class LinkCallbacks : public BLEServerCallbacks {
- public:
-  void onConnect(BLEServer *server, ble_gap_conn_desc *desc) override {
-    (void)server;
-    (void)desc;
-    phoneConnected = true;
-    phoneSeenMs = millis();
-    phoneEverSeen = true;
-  }
-
-  void onDisconnect(BLEServer *server, ble_gap_conn_desc *desc) override {
-    (void)desc;
-    phoneConnected = server != nullptr && server->getConnectedCount() > 0;
-    if (!phoneConnected) {
-      __sync_fetch_and_add(&dropCount, 1);
+    if (!d["tz_min"].isNull()) {
+      JsonDocument s; s["tz_min"] = d["tz_min"];
+      if (!settingsCommand(s.as<JsonObjectConst>())) { ack(id,false,"Invalid timezone."); return; }
     }
-  }
-};
-
-bool ensureBle() {
-  if (BLEDevice::getInitialized()) {
-    return true;
-  }
-  return BLEDevice::init("Bottle");
+    if (!clockSvc.setEpoch((time_t)d["epoch"].as<int64_t>())) { ack(id,false,"Could not set system time."); return; }
+    wifiTime.appTimeSet();
+  } else if (!strcmp(cmd,"tare") || !strcmp(cmd,"calibrate")) {
+    const bool tare = !strcmp(cmd,"tare");
+    const float grams = d["grams"] | 0.0f;
+    if (!tare && (!nvm.data.hasTare || !d["grams"].is<double>() || !isfinite(grams) || grams <= 0 || grams > 10000)) {
+      ack(id,false,"Zero the empty base first, then use a known 1–10000 g weight."); return;
+    }
+    if (!scale.startOperation(tare ? 0 : grams)) { ack(id,false,"Scale busy."); return; }
+    maintenanceId = id; maintenanceTare = tare; maintenanceBle = fromBle; maintenanceSession = ble.session();
+    return; // ACK only after sampling + flash save succeed.
+  } else if (!strcmp(cmd,"phone.clear")) {
+    if (!nvm.clearBleMac()) { ack(id,false,"Could not clear saved peer. Flash save failed."); return; }
+  } else { ack(id,false,"Unknown command. Update the app/firmware together."); return; }
+  ack(id,true); status();
 }
-
-bool samePhone(const uint8_t *native) {
-  if (!nvm.data.hasIrk || native == nullptr) {
-    return false;
-  }
-  uint8_t printed[6];
-  for (int i = 0; i < 6; i++) {
-    printed[i] = native[5 - i];
-  }
-  if (nvm.data.hasBleMac && memcmp(printed, nvm.data.bleMac, 6) == 0) {
-    return true;
-  }
-  if ((native[5] & 0xC0) != 0x40) {
-    return false;
-  }
-  uint8_t key[16];
-  uint8_t plain[16];
-  uint8_t cipher[16];
-  for (int i = 0; i < 16; i++) {
-    key[i] = nvm.data.irk[15 - i];
-  }
-  memset(plain, 0, sizeof(plain));
-  plain[13] = native[5];
-  plain[14] = native[4];
-  plain[15] = native[3];
-  mbedtls_aes_context aes;
-  mbedtls_aes_init(&aes);
-  const int keyRc = mbedtls_aes_setkey_enc(&aes, key, 128);
-  const int cryptRc = keyRc == 0 ? mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, plain, cipher) : keyRc;
-  mbedtls_aes_free(&aes);
-  if (cryptRc != 0) {
-    return false;
-  }
-  return cipher[15] == native[0] && cipher[14] == native[1] && cipher[13] == native[2];
-}
-
-void printMac(const uint8_t mac[6]) {
-  for (int i = 0; i < 6; i++) {
-    if (i > 0) {
-      Serial.print(':');
-    }
-    if (mac[i] < 16) {
-      Serial.print('0');
-    }
-    Serial.print(mac[i], HEX);
-  }
-}
-
-void reportDrops() {
-  const unsigned drops = __sync_lock_test_and_set(&dropCount, 0);
-  if (drops == 0) {
-    return;
-  }
-  Serial.print("phone disconnected");
-  if (drops > 1) {
-    Serial.print(' ');
-    Serial.print(drops);
-  }
-  Serial.println();
-}
-
-bool phoneIsConnected() {
-  if (phoneConnected) {
-    phoneSeenMs = millis();
-    phoneEverSeen = true;
-    return true;
-  }
-  if (!serverReady || !BLEDevice::getInitialized()) {
-    return false;
-  }
-  BLEServer *server = BLEDevice::getServer();
-  const bool connected = server != nullptr && server->getConnectedCount() > 0;
-  if (connected) {
-    phoneSeenMs = millis();
-    phoneEverSeen = true;
-  }
-  return connected;
-}
-
-void holdPing(bool on) { presence.holdRadio(on); }
-
-void pumpScale() { scale.poll(nvm.data); }
-
-PhoneProbe probePhone() {
-  presence.suspend(pairing);
-  const bool configured = nvm.data.hasIrk || nvm.data.hasBleMac;
-  if (!configured) {
-    return PhoneProbe::Allow;
-  }
-  if (pairing) {
-    return PhoneProbe::Deny;
-  }
-  return presence.probe(phoneIsConnected(), pumpScale);
-}
-
-AtHome currentAtHome() {
-  AtHome home;
-  const bool configured = nvm.data.hasIrk || nvm.data.hasBleMac;
-  if (!configured) {
-    home.watching = false;
-    home.decided = true;
-    home.home = true;
-    return home;
-  }
-  home.watching = true;
-  home.decided = true;
-  home.home = presence.here();
-  return home;
-}
-
-void reportPresence(const AtHome &home) {
-  static int last = -1;
-  const int state = !home.watching ? 0 : (home.home ? 1 : 2);
-  if (state == last) {
-    return;
-  }
-  last = state;
-  if (state == 0) {
-    Serial.println("presence: not watching, reminders allowed");
-  } else if (state == 1) {
-    Serial.println("presence: phone here, reminders allowed");
-  } else {
-    Serial.println("presence: phone away, reminders off");
-  }
-}
-
-void finishPair() {
-  if (!pairReady) {
-    return;
-  }
-  __sync_synchronize();
-  pairReady = false;
-  if (pairResult.status != 0 || !pairResult.hasMac) {
-    Serial.print("pair failed ");
-    Serial.println(pairResult.status);
-    return;
-  }
-  if (!pairResult.hasIrk || !nvm.saveIrk(pairResult.irk) || !nvm.saveBleMac(pairResult.mac)) {
-    Serial.println("paired, phone did not share its identity key");
-    return;
-  }
-  if (phoneIsConnected()) {
-    BLEDevice::getAdvertising()->stop();
-  }
-  pairing = false;
-  presence.setAddress(pairResult.mac);
-  if (pairResult.sameSaved) {
-    Serial.println("phone connected");
-    return;
-  }
-  Serial.print("phone paired ");
-  printMac(pairResult.mac);
-  Serial.println();
-  if (pairResult.replaced) {
-    Serial.println("replaced previous phone");
-  }
-  Serial.println("phone: ok");
-}
-
-void startBleServer(bool announce) {
-  if (announce) {
-    Serial.println("pairing");
-    Serial.println("On the phone, open Bluetooth and pair with Bottle");
-  }
-  if (!ensureBle()) {
-    Serial.println("bluetooth failed to start");
-    return;
-  }
-  BLEDevice::getScan()->stop();
-  BLESecurity::setAuthenticationMode(true, false, true);
-  BLESecurity::setCapability(ESP_IO_CAP_NONE);
-  BLESecurity::setInitEncryptionKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
-  BLESecurity::setRespEncryptionKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
-  static PairCallbacks callbacks;
-  static LinkCallbacks linkCallbacks;
-  BLEDevice::setSecurityCallbacks(&callbacks);
-  if (!serverReady) {
-    BLEServer *server = BLEDevice::createServer();
-    BLEService *service = server->createService(BLEUUID((uint16_t)0x180A));
-    BLECharacteristic *name = service->createCharacteristic(
-        BLEUUID((uint16_t)0x2A00), BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_READ_ENC);
-    name->setValue("Bottle");
-    service->start();
-    BLEAdvertising *adv = BLEDevice::getAdvertising();
-    adv->addServiceUUID(BLEUUID((uint16_t)0x180A));
-    adv->setScanResponse(true);
-    adv->setMinInterval(160);
-    adv->setMaxInterval(320);
-    adv->setName("Bottle");
-    serverReady = true;
-  }
-  BLEServer *server = BLEDevice::getServer();
-  server->setCallbacks(&linkCallbacks);
-  server->advertiseOnDisconnect(true);
-  if (phoneIsConnected()) {
-    if (announce) {
-      Serial.println("phone still connected");
-    }
-    return;
-  }
-  if (!BLEDevice::getAdvertising()->start()) {
-    Serial.println("pair advertise failed");
-    return;
-  }
-  if (announce) {
-    pairing = true;
-    pairingMs = millis();
-  }
-}
-
-void startPairing() { startBleServer(true); }
-
-void bindPresence() {
-  if (!nvm.data.hasIrk && !nvm.data.hasBleMac) {
-    return;
-  }
-  if (!BLEDevice::getInitialized() && !ensureBle()) {
-    return;
-  }
-  uint8_t mac[6];
-  bool found = false;
-  ble_addr_t peers[3];
-  int count = 0;
-  if (ble_store_util_bonded_peers(peers, &count, 3) == 0) {
-    int chosen = -1;
-    for (int i = 0; i < count; i++) {
-      struct ble_store_key_sec key;
-      struct ble_store_value_sec value;
-      memset(&key, 0, sizeof(key));
-      key.peer_addr = peers[i];
-      if (ble_store_read_peer_sec(&key, &value) != 0 || !value.irk_present || !nvm.data.hasIrk) {
-        continue;
-      }
-      if (memcmp(value.irk, nvm.data.irk, 16) == 0) {
-        chosen = i;
-        break;
-      }
-    }
-    if (chosen < 0 && count > 0) {
-      chosen = 0;
-    }
-    if (chosen >= 0) {
-      for (int i = 0; i < 6; i++) {
-        mac[i] = peers[chosen].val[5 - i];
-      }
-      found = true;
-    }
-  }
-  if (!found && nvm.data.hasBleMac) {
-    memcpy(mac, nvm.data.bleMac, 6);
-    found = true;
-  }
-  if (!found) {
-    return;
-  }
-  presence.setAddress(mac);
-  Serial.print("presence ping ");
-  printMac(mac);
-  Serial.println();
-}
-
-bool printableName(const char *text) {
-  if (text == nullptr || text[0] == '\0') {
-    return false;
-  }
-  for (const char *p = text; *p; ++p) {
-    if (*p < 32 || *p > 126) {
-      return false;
-    }
-  }
-  return true;
-}
-
-void copyField(char *dest, size_t destLen, const uint8_t *data, uint8_t length) {
-  if (length >= destLen) {
-    length = destLen - 1;
-  }
-  memcpy(dest, data, length);
-  dest[length] = '\0';
-}
-
-void readNames(BLEAdvertisedDevice &device, char *full, char *shortName) {
-  full[0] = '\0';
-  shortName[0] = '\0';
-  const uint8_t *payload = device.getPayload();
-  const size_t len = device.getPayloadLength();
-  size_t i = 0;
-  while (payload != nullptr && i + 1 < len) {
-    const uint8_t field = payload[i];
-    if (field == 0 || i + 1 + field > len) {
-      break;
-    }
-    const uint8_t type = payload[i + 1];
-    const uint8_t *data = payload + i + 2;
-    const uint8_t n = field - 1;
-    if (type == 0x09) {
-      copyField(full, 25, data, n);
-    } else if (type == 0x08 && shortName[0] == '\0') {
-      copyField(shortName, 25, data, n);
-    }
-    i += field + 1;
-  }
-}
-
-bool nameMatches(const char *name, const char *query) {
-  if (query == nullptr || query[0] == '\0') {
-    return true;
-  }
-  char left[25];
-  char right[48];
-  strncpy(left, name, sizeof(left) - 1);
-  left[sizeof(left) - 1] = '\0';
-  strncpy(right, query, sizeof(right) - 1);
-  right[sizeof(right) - 1] = '\0';
-  for (char *p = left; *p; ++p) {
-    *p = (char)tolower(*p);
-  }
-  for (char *p = right; *p; ++p) {
-    *p = (char)tolower(*p);
-  }
-  return strstr(left, right) != nullptr;
-}
-
-void searchPhones(const char *query) {
-  Serial.println("searching");
-  if (!ensureBle()) {
-    Serial.println("phone scan failed to start");
-    heardCount = 0;
-    return;
-  }
-  if (phoneIsConnected()) {
-    Serial.println("phone still connected");
-    heardCount = 0;
-    return;
-  }
-  presence.suspend(true);
-  const bool resumeAdvert = BLEDevice::getAdvertising()->isAdvertising();
-  if (resumeAdvert) {
-    BLEDevice::getAdvertising()->stop();
-  }
-  static NameScan nameScan;
-  BLEScan *scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(&nameScan, false, false);
-  scan->setActiveScan(true);
-  scan->setInterval(100);
-  scan->setWindow(99);
-  scan->clearResults();
-  BLEScanResults *results = scan->start(8, false);
-  heardCount = 0;
-  bool phoneHere = false;
-  int phoneRssi = 0;
-  uint8_t wanted[6];
-  const bool lookingForMac = query != nullptr && parseMac(query, wanted);
-  int found = 0;
-  if (results != nullptr) {
-    found = results->getCount();
-    for (int i = 0; i < found; i++) {
-      BLEAdvertisedDevice device = results->getDevice(i);
-      if (samePhone(device.getAddress().getNative())) {
-        phoneHere = true;
-        phoneRssi = device.getRSSI();
-        phoneSeenMs = millis();
-        phoneEverSeen = true;
-      }
-      if (!lookingForMac && heardCount >= 8) {
-        continue;
-      }
-      String mac = device.getAddress().toString();
-      mac.toLowerCase();
-      if (mac.length() < 17) {
-        continue;
-      }
-      char full[25];
-      char shortName[25];
-      readNames(device, full, shortName);
-      const char *name = printableName(full) ? full : (printableName(shortName) ? shortName : nullptr);
-      uint8_t seenMac[6];
-      const bool macHit = lookingForMac && parseMac(mac.c_str(), seenMac) && memcmp(seenMac, wanted, 6) == 0;
-      if (!macHit && (name == nullptr || !nameMatches(name, query))) {
-        continue;
-      }
-      const char *label = name != nullptr ? name : "no name";
-      strncpy(heard[heardCount].name, label, sizeof(heard[heardCount].name) - 1);
-      heard[heardCount].name[sizeof(heard[heardCount].name) - 1] = '\0';
-      strncpy(heard[heardCount].mac, mac.c_str(), sizeof(heard[heardCount].mac) - 1);
-      heard[heardCount].mac[sizeof(heard[heardCount].mac) - 1] = '\0';
-      heard[heardCount].rssi = device.getRSSI();
-      heardCount++;
-    }
-  }
-  if (resumeAdvert && !phoneIsConnected()) {
-    BLEDevice::getAdvertising()->start();
-  }
-  presence.suspend(false);
-  Serial.print("heard ");
-  Serial.print(found);
-  Serial.println(" devices");
-  if (nvm.data.hasIrk) {
-    if (phoneHere) {
-      Serial.print("phone: here ");
-      Serial.println(phoneRssi);
-    } else {
-      Serial.println("phone: not heard");
-    }
-  }
-  if (heardCount == 0) {
-    Serial.println(lookingForMac ? "not seen" : (query != nullptr && query[0] != '\0' ? "no phone with that name" : "no named phones heard"));
-    return;
-  }
-  for (int i = 0; i < heardCount; i++) {
-    Serial.print(i + 1);
-    Serial.print(' ');
-    Serial.print(heard[i].name);
-    Serial.print(' ');
-    Serial.print(heard[i].mac);
-    Serial.print(' ');
-    Serial.println(heard[i].rssi);
-  }
-  Serial.println("s <number> saves that phone");
-}
-
-String phonesJson() {
-  searchPhones("");
-  String json = "[";
-  for (int i = 0; i < heardCount; i++) {
-    if (i > 0) {
-      json += ',';
-    }
-    json += "{\"name\":\"";
-    for (const char *p = heard[i].name; *p; ++p) {
-      if (*p == '"' || *p == '\\') {
-        json += '\\';
-      }
-      json += *p;
-    }
-    json += "\",\"mac\":\"";
-    json += heard[i].mac;
-    json += "\"}";
-  }
-  json += ']';
-  return json;
-}
-
-void saveHeard(int number) {
-  if (number < 1 || number > heardCount) {
-    Serial.println("search first with b, then s <number>");
-    return;
-  }
-  uint8_t bytes[6];
-  if (!parseMac(heard[number - 1].mac, bytes) || !nvm.saveBleMac(bytes)) {
-    Serial.println("phone save failed");
-    return;
-  }
-  Serial.print("phone saved ");
-  Serial.println(heard[number - 1].mac);
-}
-
-void printHelp() {
-  Serial.println("t zero the empty base");
-  Serial.println("c <grams> calibrate from a known weight");
-  Serial.println("p pair the phone. On the phone, open Bluetooth and tap Bottle");
-  Serial.println("If that phone drops, Bottle advertises again");
-  Serial.println("b search names, b ultra finds a name, s <number> saves");
-  Serial.println("n scan 2.4 GHz Wi-Fi, j <ssid>|<pass> save Wi-Fi and join");
-  Serial.println("r <ssid> forgets one saved Wi-Fi");
-  Serial.println("a page status, w print weight, h help");
-  Serial.println("i <seconds> reminder check until reboot, i 0 uses saved minutes");
-  Serial.println("d clears today's total");
-}
-
-void handleLine() {
-  if (lineLen == 0) {
-    return;
-  }
-  line[lineLen] = '\0';
-  const char cmd = line[0];
-  if (cmd == 'h' || cmd == '?' || cmd == 'H') {
-    printHelp();
-  } else if (cmd == 't' || cmd == 'T') {
-    if (scale.tare(nvm)) {
-      hydration.forgetBaseline(nvm);
-      Serial.print("zero saved ");
-      Serial.println(nvm.data.tareOffset);
-    } else {
-      Serial.println("tare failed");
-    }
-  } else if (cmd == 'c' || cmd == 'C') {
-    const float known = strtof(line + 1, nullptr);
-    if (scale.calibrate(nvm, known)) {
-      Serial.print("cal_factor ");
-      Serial.println(nvm.data.calFactor, 4);
-    } else {
-      Serial.println("calibrate failed. Zero first, then c <grams>.");
-    }
-  } else if (cmd == 'p' || cmd == 'P') {
-    startPairing();
-  } else if (cmd == 'b' || cmd == 'B') {
-    const char *query = line + 1;
-    while (*query == ' ') {
-      query++;
-    }
-    searchPhones(query);
-  } else if (cmd == 's' || cmd == 'S') {
-    saveHeard(atoi(line + 1));
-  } else if (cmd == 'a' || cmd == 'A') {
-    portal.printStatus();
-  } else if (cmd == 'r' || cmd == 'R') {
-    char *arg = line + 1;
-    while (*arg == ' ') {
-      arg++;
-    }
-    if (arg[0] == '\0' || !nvm.removeNet(arg)) {
-      Serial.println("wifi forget failed");
-    } else {
-      Serial.print("forgot wifi ");
-      Serial.println(arg);
-      portal.restartRadio();
-    }
-  } else if (cmd == 'n' || cmd == 'N') {
-    portal.printWifis();
-  } else if (cmd == 'j' || cmd == 'J') {
-    char *arg = line + 1;
-    while (*arg == ' ') {
-      arg++;
-    }
-    char *sep = strchr(arg, '|');
-    if (sep == nullptr) {
-      Serial.println("use: j <ssid>|<password>");
-    } else {
-      *sep = '\0';
-      const char *pass = sep + 1;
-      if (nvm.saveNet(arg, pass)) {
-        Serial.print("saved wifi ");
-        Serial.println(arg);
-        portal.restartRadio();
-      } else {
-        Serial.println("wifi save failed (ssid <= 32, pass 8-63 or empty)");
-      }
-    }
-  } else if (cmd == 'd' || cmd == 'D') {
-    hydration.clearToday(nvm);
-    Serial.println("today cleared");
-  } else if (cmd == 'i' || cmd == 'I') {
-    hydration.setCheckSeconds((uint16_t)atoi(line + 1), nvm);
-  } else if (cmd == 'w' || cmd == 'W') {
-    lastPrintMs = 0;
-  } else {
-    Serial.println("unknown. h for help");
-  }
-  lineLen = 0;
-}
-
 void pollSerial() {
-  while (Serial.available() > 0) {
-    const char c = (char)Serial.read();
-    if (c == '\r' || c == '\n') {
-      handleLine();
-    } else if (lineLen < sizeof(line) - 1) {
-      line[lineLen++] = c;
-    }
+  // Bound input work each loop so even a noisy host can't starve the scale.
+  for (int i = 0; i < 128 && Serial.available(); ++i) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (serialDiscard) ack(0,false,"Command too long.");
+      else if (serialLine.length()) processCommand(serialLine.c_str());
+      serialLine = ""; serialDiscard = false;
+    } else if (serialLine.length() >= BottleBle::kMaxLine || c == 0) serialDiscard = true;
+    else if (!serialDiscard) serialLine += c;
   }
 }
-
-bool waitForRaw() {
-  const uint32_t start = millis();
-  while (millis() - start < WEIGHT_WAIT_MS) {
-    scale.poll(nvm.data);
-    outputs.rainbow(30);
-    int32_t raw = 0;
-    if (scale.latestRaw(&raw, WEIGHT_WAIT_MS)) {
-      return true;
-    }
-    delay(10);
-  }
-  return false;
-}
-
-void printChecks(bool haveWeight) {
-  if (!haveWeight) {
-    Serial.println("weight: no data");
-  } else if (scale.fault()) {
-    Serial.println("weight: stuck at full scale, check load cell wires");
-  } else {
-    Serial.println("weight: ok");
-  }
-  Serial.println(nvm.data.hasTare ? "zero: ok" : "zero: not zeroed");
-  Serial.println(nvm.data.hasCal ? "cal: ok" : "cal: not calibrated");
-  if (nvm.data.hasIrk) {
-    Serial.println("phone: ok");
-  } else if (nvm.data.hasBleMac) {
-    Serial.println("phone: saved address");
-  } else {
-    Serial.println("phone: no bluetooth address");
-  }
-}
-
-bool insideWindow() {
-  if (!wallClock.valid || nvm.data.startMin == nvm.data.endMin) {
-    return false;
-  }
-  const uint16_t nowMin = (uint16_t)(wallClock.hour * 60 + wallClock.minute);
-  if (nvm.data.startMin < nvm.data.endMin) {
-    return nowMin >= nvm.data.startMin && nowMin < nvm.data.endMin;
-  }
-  return nowMin >= nvm.data.startMin || nowMin < nvm.data.endMin;
-}
-
-void printWindow() {
-  if (!wallClock.valid) {
-    Serial.println("window: no time");
-    return;
-  }
-  Serial.println(insideWindow() ? "window: inside" : "window: outside");
-}
-
-void printTime() {
-  if (!wallClock.valid) {
-    Serial.println("time: no time");
-    printWindow();
-    return;
-  }
-  Serial.print("time: ");
-  if (wallClock.hour < 10) {
-    Serial.print('0');
-  }
-  Serial.print(wallClock.hour);
-  Serial.print(':');
-  if (wallClock.minute < 10) {
-    Serial.print('0');
-  }
-  Serial.println(wallClock.minute);
-  printWindow();
-}
-
-void printSample(uint32_t now) {
-  if (now - lastPrintMs < 1000) {
-    return;
-  }
-  lastPrintMs = now;
-  int32_t raw = 0;
-  if (!scale.latestRaw(&raw, 1000)) {
-    Serial.println("scale: no data");
-    return;
-  }
-  Serial.print("raw ");
-  Serial.print(raw);
-  float grams = 0.0f;
-  if (scale.fault()) {
-    Serial.println("  scale fault: check load cell wires");
-  } else if (scale.latestGrams(&grams, 1000)) {
-    Serial.print("  g ");
-    Serial.println(grams, 1);
-  } else {
-    Serial.println("  (t to zero, then c <grams>)");
-  }
-}
-
-void pumpIo() {
-  scale.poll(nvm.data);
-  portal.tick();
-}
-
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  outputs.begin();
-  scale.begin();
-  if (!nvm.begin()) {
-    Serial.println("NVM open failed");
-    return;
-  }
-  nvm.load();
-  hydration.begin(nvm.data);
-  hydration.setPump(pumpIo);
-  Serial.println();
-  Serial.println("scale");
-  const bool haveWeight = waitForRaw();
-  printChecks(haveWeight);
-  portal.begin(&nvm, &scale, &hydration, &wallClock, phonesJson, currentAtHome, &outputs, holdPing);
-  if (nvm.data.staSsid[0] == '\0') {
-    Serial.println("wifi: no credentials");
-    printTime();
-  } else if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("wifi: connected");
-    printTime();
-  } else {
-    Serial.println("wifi: not connected");
-    printTime();
-  }
-  // BLE advertising during the WPA handshake is a known C3 failure mode.
-  bleAfterMs = millis() + BLE_AFTER_WIFI_MS;
-  if (WiFi.status() == WL_CONNECTED || nvm.data.staSsid[0] == '\0') {
-    startBleNow();
-  }
-  printHelp();
+  outputs.begin(); scale.begin();
+  ready = nvm.begin();
+  bleReady = ble.begin();
+  if (!ready) { status(); return; } // Remain reachable to report storage failure.
+  nvm.load(); clockSvc.begin(nvm.data.tzMin); hydration.begin(nvm.data);
+  wifiTime.begin(nvm,clockSvc);
+  status();
 }
-
-void startBleNow() {
-  if (bleStarted) {
-    return;
-  }
-  bleStarted = true;
-  if (nvm.data.hasIrk) {
-    startBleServer(false);
-  }
-  bindPresence();
-}
-
 void loop() {
-  scale.poll(nvm.data);
-  portal.tick();
+  if (!ready) {
+    outputs.show(0,0,0,false,false,BEEP_OFF);
+    if (bleReady) {
+      ble.tick();
+      static BottleBle::Command command;
+      if (ble.txIdle() && ble.popCommand(command)) {
+        processCommand(command.text,true); memset(command.text,0,sizeof(command.text));
+      }
+    }
+    pollSerial(); delay(1); return;
+  }
+  scale.poll(nvm.data); clockSvc.tick(); wifiTime.tick(clockSvc);
+  if (bleReady) {
+    ble.tick();
+    static bool lastLink = false;
+    BottleBle::Link link;
+    while (ble.popLink(link)) {
+      lastLink = link.connected;
+      if (link.connected) {
+        presence.connected(millis());
+        if (!nvm.data.hasBleMac || memcmp(nvm.data.bleMac,link.mac,6)) {
+          if (!nvm.saveBleMac(link.mac)) event("storage_error");
+        }
+      } else {
+        presence.disconnected(millis());
+        if (dumpBle) { dumpIndex = -1; dump.clear(); }
+      }
+    }
+    // Reconcile BOTH directions even if a disconnect event was dropped.
+    const bool linked = ble.connected();
+    if (linked) presence.connected(millis());
+    else if (lastLink) presence.disconnected(ble.disconnectedAt());
+    lastLink = linked;
+    if (ble.overflowed()) { replyBle = true; ack(0,false,"Command queue full or frame too long. Retry."); }
+    static BottleBle::Command command;
+    if (ble.txIdle() && ble.popCommand(command)) {
+      processCommand(command.text,true); memset(command.text,0,sizeof(command.text));
+    }
+  }
   pollSerial();
-  reportDrops();
-  finishPair();
-  scale.poll(nvm.data);
-  if (!bleStarted && (WiFi.status() == WL_CONNECTED || (int32_t)(millis() - bleAfterMs) >= 0)) {
-    startBleNow();
+  if (scale.busy()) {
+    outputs.show(0,0,0,false,false,BEEP_OFF);
+    int result = scale.finishOperation(nvm);
+    if (result) {
+      if (result > 0 && !hydration.forgetBaseline(nvm)) result = -1;
+      replyBle = maintenanceBle;
+      if (!maintenanceBle || maintenanceSession == ble.session()) ack(maintenanceId,result > 0,result < 0 ? "Scale unstable or unavailable. Keep it still, check wiring and retry." : "");
+      status();
+    }
+  } else {
+    hydration.tick(millis(),scale,nvm,outputs,clockSvc.clock(),presence.here(millis()));
+    const uint16_t events = hydration.takeEvents();
+    if (events & HydrationEngine::Drink) event("drink",hydration.lastDrinkMl());
+    if (events & HydrationEngine::Refill) event("refill");
+    if (events & HydrationEngine::Lifted) event("lifted");
+    if (events & HydrationEngine::Returned) event("returned");
+    if (events & HydrationEngine::Reminder) event("reminder");
+    if (events & HydrationEngine::MissingAlert) event("missing_alert");
+    if (events & HydrationEngine::Paused) event("paused");
+    if (events & HydrationEngine::ScaleError) event("scale_error");
+    static bool storageFault = false;
+    if (hydration.storageFault() && !storageFault) event("storage_error");
+    storageFault = hydration.storageFault();
   }
-  if (pairing && millis() - pairingMs > PAIRING_WINDOW_MS) {
-    pairing = false;
+  discovery.tick();
+  if (discovery.takeFinished()) {
+    JsonDocument result; result["type"] = "wifi.scan"; result["id"] = discovery.id();
+    result["ok"] = !discovery.error()[0];
+    if (discovery.error()[0]) result["error"] = discovery.error();
+    result["truncated"] = discovery.truncated(); result["hidden_count"] = discovery.hiddenCount();
+    auto nets = result["networks"].to<JsonArray>();
+    for (int i = 0; i < discovery.count(); ++i) {
+      const auto &n = discovery.network(i); auto item = nets.add<JsonObject>();
+      item["ssid"] = n.ssid; item["rssi"] = n.rssi; item["secured"] = n.secured;
+    }
+    sendJson(result,discovery.fromBle() && ble.session() == discovery.session());
   }
-  const AtHome home = currentAtHome();
-  reportPresence(home);
-  hydration.tick(millis(), scale, nvm, outputs, wallClock, probePhone);
-  printSample(millis());
+  tickDump();
+  if (bleReady && ble.connected() && dumpIndex < 0 && ble.txIdle() && millis()-lastStatusMs >= 2000) status();
+  delay(1); // yield to radio/RTOS without blocking sensor state transitions
 }

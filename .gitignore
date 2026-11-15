@@ -1,0 +1,7 @@
+# Local build/test output (may contain device-specific diagnostics)
+.build/
+artifacts/
+*.bin
+*.elf
+.DS_Store
+__pycache__/
