@@ -92,11 +92,74 @@ void main() {
       expect(find.text('bottle'), findsOneWidget);
       expect(find.text('Meet your bottle'), findsOneWidget);
       expect(find.text('Find my bottle'), findsOneWidget);
+      expect(find.text('Waiting for app connection'), findsOneWidget);
+      expect(find.textContaining('Selected phone: Unknown'), findsOneWidget);
+      expect(find.textContaining('Presence is always on'), findsOneWidget);
+      expect(find.text('App BLE connected · present'), findsNothing);
       await navigate(tester, 'Settings');
       expect(find.text('Waiting for your bottle'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
+  testWidgets('Setup explains mandatory presence without a toggle', (
+    tester,
+  ) async {
+    await mount(tester);
+    await navigate(tester, 'Setup');
+    expect(find.text('4  Select your Classic phone'), findsOneWidget);
+    expect(
+      find.textContaining('Presence is always on (read-only)'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('app does not need to stay open'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('system Bluetooth settings'), findsOneWidget);
+    expect(
+      find.textContaining('iPhone hardware testing is pending'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Selected phone: Present'), findsOneWidget);
+    expect(find.byType(SwitchListTile), findsNothing);
+    expect(find.text('Require active app link for alerts'), findsNothing);
+    expect(find.textContaining('Optional: reminders'), findsNothing);
+    await navigate(tester, 'Settings');
+    expect(find.text('Mute sound (Do not disturb)'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('setting-presence_enabled')),
+      findsNothing,
+    );
+    expect(transport.commands.where((c) => c['cmd'] == 'settings'), isEmpty);
+  });
+
+  for (final scenario in [
+    (true, true, 'Present · selected phone replied over Classic'),
+    (false, true, 'Present · selected phone replied over Classic'),
+    (false, false, 'Unknown · waiting for a fresh Classic check'),
+    (true, false, 'Unknown · waiting for a fresh Classic check'),
+    (null, null, 'Unknown · waiting for a fresh Classic check'),
+  ]) {
+    testWidgets('Home displays actual presence: ${scenario.$3}', (
+      tester,
+    ) async {
+      transport.status['phone_connected'] = scenario.$1;
+      transport.status['phone_present'] = scenario.$2;
+      await mount(tester);
+      expect(find.textContaining(scenario.$3), findsOneWidget);
+      expect(find.textContaining('Presence is always on'), findsOneWidget);
+      expect(find.textContaining('Presence gate off'), findsNothing);
+      // Next check keeps the countdown even when Classic presence is stale;
+      // presence detail stays in At a glance / Setup.
+      expect(find.text('In 15 min'), findsOneWidget);
+      expect(
+        find.text('Alerts wait for a fresh selected-phone Classic check'),
+        findsNothing,
+      );
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   for (final width in [390.0, 1280.0]) {
     testWidgets('all pages render without overflow at ${width.toInt()}px', (
       tester,
@@ -566,10 +629,7 @@ void main() {
     await tester.ensureVisible(button);
     await tester.tap(button);
     await tester.pumpAndSettle();
-    expect(
-      find.textContaining('automatically remembers the connecting phone'),
-      findsOneWidget,
-    );
+    expect(find.textContaining('configuration only'), findsOneWidget);
     expect(transport.connects, 0);
     await tester.tap(find.widgetWithText(FilledButton, 'Connect'));
     await tester.pumpAndSettle();

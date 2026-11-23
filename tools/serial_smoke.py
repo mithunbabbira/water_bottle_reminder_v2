@@ -33,9 +33,9 @@ NETWORK_KEYS = {"net_count", "sta_ssid", "sta_pass", "ap_ssid", "ap_pass", "ap_b
 NETWORK_KEYS |= {f"wifi_{kind}{i}" for i in range(4) for kind in ("s", "p")}
 REQUIRED_NVS = (SETTING_KEYS | NETWORK_KEYS | {
     "schema", "tare_offset", "cal_factor", "baseline_weight", "daily_total",
-    "last_day", "ble_mac", "ble_irk",
+    "last_day", "ble_mac", "ble_irk", "classic_mac", "classic_name",
 }) - {"sta_ssid", "sta_pass"}  # Firmware may expose primary-network aliases too.
-STABLE_NVS = SETTING_KEYS | NETWORK_KEYS | {"tare_offset", "cal_factor", "ble_irk"}
+STABLE_NVS = SETTING_KEYS | NETWORK_KEYS | {"tare_offset", "cal_factor", "ble_irk", "classic_mac", "classic_name"}
 
 
 class SmokeFailure(Exception):
@@ -68,9 +68,9 @@ def sanitize(value: Any) -> Any:
                 result[key] = item if item is None or item in ("set", "empty") else "[REDACTED]"
             elif key in {"error", "wifi_error", "message"} and item:
                 result[key] = "[device text omitted]"
-            elif key in {"phone_mac", "ble_mac"}:
+            elif key in {"phone_mac", "ble_mac", "classic_mac", "app_peer_mac"}:
                 result[key] = "[REDACTED]" if item else item
-            elif key == "value" and value.get("key") == "ble_mac":
+            elif key == "value" and value.get("key") in {"ble_mac", "classic_mac"}:
                 result[key] = "[REDACTED]" if item else item
             else:
                 result[key] = sanitize(item)

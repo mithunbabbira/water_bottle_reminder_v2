@@ -4,7 +4,7 @@
 // A MAC address is useful diagnostics, not proof that an ordinary phone is
 // nearby. Phones are BLE centrals and rotate private addresses. Do not block the
 // hydration loop attempting to connect to a phone that is not advertising.
-// Optional presence mode instead requires the app link, with disconnect grace.
+// Mandatory presence requires the app link, with disconnect grace and no boot grace.
 class PhonePresence {
  public:
   void connected(uint32_t now) { linked_ = true; seen_ = true; lastSeen_ = now; }

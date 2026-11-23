@@ -1,4 +1,5 @@
 #include "Hydration.h"
+#include "PhonePresence.h"
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -28,6 +29,7 @@ struct Rig {
   HydrationInput in;
   uint32_t now;
   explicit Rig(uint32_t start = 0, bool saved = false, float base = 700, float total = 0) : now(start) {
+    in.phoneHere = true;
     in.scaleValid = true; in.grams = 700; in.clockValid = in.activeWindow = true; in.day = 20261115;
     e.begin(now, saved, base, total, 20261115);
   }
@@ -73,6 +75,12 @@ static void drinkRefillSips() {
   r.lift(); r.returned(690); NEAR(r.e.dailyMl(), 110); NEAR(r.e.lastDrinkMl(), 60);
 }
 static void missingQuietDndAway() {
+  PhonePresence p; CHECK(!p.here(0)); CHECK(!p.here(100000));
+  p.connected(100000); CHECK(p.here(999999));
+  p.disconnected(100001); CHECK(p.here(160000)); CHECK(!p.here(160001));
+  p.connected(160002); CHECK(p.here(160002));
+  p.disconnected(0xfffffff0u); CHECK(p.here(uint32_t(0xfffffff0u + 59999u)));
+  CHECK(!p.here(uint32_t(0xfffffff0u + 60000u)));
   Rig r; r.s.missingMs = 10000; r.s.beepDelayMs = 0; r.s.missingColor = 0x123456;
   r.boot(); r.lift(); r.hold(10300, 0); CHECK(r.e.alerting()); CHECK(r.e.frame().color == 0x123456);
   r.hold(500, 0); CHECK(r.e.frame().beep);
@@ -80,9 +88,38 @@ static void missingQuietDndAway() {
   r.in.activeWindow = false; r.step(0); CHECK(!r.e.alerting()); CHECK(r.e.frame().color == 255); CHECK(!r.e.frame().white);
   r.in.activeWindow = true; r.in.clockValid = false; r.step(0); CHECK(!r.e.alerting()); CHECK(r.e.frame().color == 255);
   r.in.clockValid = true; r.step(0); CHECK(r.e.alerting());
-  r.s.presenceEnabled = true; r.in.phoneHere = false; r.step(0); CHECK(!r.e.alerting()); CHECK(!r.e.frame().beep && !r.e.frame().white);
+  r.in.phoneHere = false; r.step(0); CHECK(!r.e.alerting()); CHECK(!r.e.frame().beep && !r.e.frame().white);
   r.in.phoneHere = true; r.step(0); CHECK(r.e.alerting());
-  r.s.presenceEnabled = false; r.in.phoneHere = false; r.step(0); CHECK(r.e.alerting());
+  r.in.phoneHere = false; r.step(0); CHECK(!r.e.alerting());
+  Rig bootAway; bootAway.in.phoneHere = false; bootAway.boot();
+  bootAway.hold(bootAway.s.intervalMs + 1000, 700); CHECK(!bootAway.e.alerting());
+  bootAway.in.phoneHere = true; bootAway.step(700); CHECK(bootAway.e.alerting());
+  bootAway.in.phoneHere = false; bootAway.step(700); CHECK(!bootAway.e.alerting());
+}
+static void classicPresenceDemandAndDrinkFeedback() {
+  Rig r; r.s.intervalMs = 2000; r.in.phoneHere = false;
+  CHECK(!r.e.needsPresence(r.now)); r.boot(); CHECK(!r.e.needsPresence(r.now));
+  r.hold(2500, 700); CHECK(!r.e.alerting()); CHECK(r.e.needsPresence(r.now));
+  CHECK(!r.e.frame().white && !r.e.frame().beep && r.e.frame().color != r.s.reminderColor);
+  r.in.phoneHere = true; r.step(700); CHECK(r.e.alerting() && r.e.needsPresence(r.now));
+  r.in.phoneHere = false; r.step(700); CHECK(!r.e.alerting() && r.e.needsPresence(r.now));
+  CHECK(!r.e.needsPresence(r.now + 401));
+  r.in.activeWindow = false; r.step(700); CHECK(!r.e.needsPresence(r.now));
+  r.in.activeWindow = true; r.in.clockValid = false; r.step(700); CHECK(!r.e.needsPresence(r.now));
+  r.in.clockValid = true; r.step(700); CHECK(r.e.needsPresence(r.now));
+  r.lift(); CHECK(!r.e.needsPresence(r.now)); r.returned(640);
+  CHECK(r.e.hasLastDrink() && r.e.frame().color == 0x00ff00);
+  CHECK(!r.e.frame().white && !r.e.frame().beep && !r.e.needsPresence(r.now));
+  r.step(640); CHECK(r.e.frame().color == 0x00ff00); // Still green away on subsequent ticks.
+  r.in.scaleFault = true; r.step(640); CHECK(!r.e.needsPresence(r.now) && r.e.frame().color == 0);
+
+  Rig m; m.s.missingMs = 1000; m.in.phoneHere = false; m.boot(); m.lift();
+  m.hold(800, 0); CHECK(!m.e.needsPresence(m.now));
+  m.hold(200, 0); CHECK(m.e.needsPresence(m.now) && !m.e.alerting());
+  m.in.phoneHere = true; m.step(0); CHECK(m.e.alerting() && m.e.needsPresence(m.now));
+  m.in.phoneHere = false; m.step(0); CHECK(!m.e.alerting() && m.e.needsPresence(m.now));
+  m.step(700); CHECK(!m.e.needsPresence(m.now)); // First physical return suppresses demand.
+  m.in.scaleValid = false; m.step(700); CHECK(!m.e.needsPresence(m.now));
 }
 static void quietStillTracks() {
   Rig r; r.boot(); r.reminder(); r.in.clockValid = false; r.step(700);
@@ -181,24 +218,26 @@ static void nvmAtomicSettings() {
   Preferences::state().fail = true; d.intervalMin = 90; CHECK(!n.saveSettings(d)); CHECK(n.data.intervalMin == 45);
   Preferences::state().fail = false;
   BottleNvm again; again.begin(); again.load(); CHECK(again.data.intervalMin == 45); CHECK(again.data.presenceEnabled);
-  for (int field = 0; field < 11; ++field) {
+  for (int field = 0; field < 12; ++field) {
     d = n.data;
     switch(field) {
       case 0: d.intervalMin = 241; break; case 1: d.startMin = 1440; break; case 2: d.endMin = 1440; break;
       case 3: d.tzMin = 1; break; case 4: d.missingSec = 9; break; case 5: d.beepDelaySec = 31; break;
       case 6: d.drinkGrams = 4; break; case 7: d.settleMs = 499; break; case 8: d.reminderColor = 0x1000000; break;
       case 9: d.missingColor = 0x1000000; break; case 10: d.beepType = 4; break;
+      case 11: d.presenceEnabled = false; break;
     }
     CHECK(!n.saveSettings(d)); CHECK(n.data.intervalMin == 45);
   }
 }
 static void nvmMigrationAndInvalidValues() {
   Preferences::reset(); Preferences p; p.begin("bottle", false);
+  p.putBool("presence_enabled", false);
   p.putLong("tare_offset", 123); p.putFloat("cal_factor", -2000); p.putFloat("baseline_weight", 700);
   p.putFloat("daily_total", 150); p.putInt("last_day", 20261115); p.putUShort("interval_min", 40);
   p.putUShort("start_min", 65535); p.putUChar("beep_type", 255); p.putShort("tz_min", -30);
   p.putString("wifi_s0", "a wifi with spaces"); p.putString("wifi_p0", "a password");
-  BottleNvm n; n.begin(); n.load(); CHECK(n.settingsStored()); CHECK(n.data.intervalMin == 40);
+  BottleNvm n; n.begin(); n.load(); CHECK(n.settingsStored()); CHECK(n.data.intervalMin == 40); CHECK(n.data.presenceEnabled);
   CHECK(n.data.startMin == 600 && n.data.beepType == 2 && n.data.tzMin == -30);
   CHECK(n.data.hasCal && n.data.hasTare && n.data.hasBaseline); NEAR(n.data.dailyTotalMl, 150);
   CHECK(n.data.netCount == 1); CHECK(n.data.lastDay == 20261115); CHECK(n.rawStored("interval_min"));
@@ -269,7 +308,8 @@ static void adapterPersistenceAndStale() {
   };
   for (int i = 0; i < 25; ++i) step(100, 700, true);
   CHECK(h.hasBaseline()); NEAR(n.data.baselineWeight, 700);
-  h.setCheckSeconds(1, n); for (int i = 0; i < 15; ++i) step(100, 700, true); CHECK(h.alerting());
+  h.setCheckSeconds(1, n); for (int i = 0; i < 15; ++i) step(100, 700, true);
+  CHECK(h.alerting() && h.needsPresence(millis()));
   step(100, 0, true); CHECK(!h.alerting()); CHECK(NativeArduino::digital()[PIN_WHITE] == LOW);
   CHECK(NativeArduino::digital()[PIN_BUZZER] == LOW); step(100, 0, true);
   Preferences::state().fail = true;
@@ -287,6 +327,7 @@ int main() {
   const std::pair<const char *, std::function<void()>> tests[] = {
     {"warmup/distinct/boot-missing", warmupDistinct}, {"lift/return/no drink", liftReturnNoDrink},
     {"drink/refill/accumulated sips", drinkRefillSips}, {"missing/quiet/dnd/away", missingQuietDndAway},
+    {"Classic demand/quiet/sensor gates/away drink feedback", classicPresenceDemandAndDrinkFeedback},
     {"quiet tracks drinks", quietStillTracks}, {"scale stale/fault/NaN", scaleFailsClosed},
     {"boot offline no intake", bootOfflineNoIntake}, {"moving-water bounded retry", movingWaterBoundedRetry},
     {"stable distinct confirmation", stabilityAndDistinctConfirmation}, {"80Hz/configured thresholds/sequence wrap", fastAdcAndConfiguredThresholds},

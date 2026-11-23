@@ -103,6 +103,22 @@ void main() {
       expect(controller.busy, isFalse);
     },
   );
+  test(
+    'read-only presence writes are rejected before BLE, including true',
+    () async {
+      await connect();
+      final initial = transport.commands.length;
+      for (final value in [false, true]) {
+        await expectLater(
+          controller.saveSettings({'presence_enabled': value}),
+          throwsA(isA<BottleCommandException>()),
+        );
+        expect(controller.bannerError, 'Unknown setting: presence_enabled');
+        expect(transport.commands.length, initial);
+        expect(controller.snapshot!.settings['presence_enabled'], isTrue);
+      }
+    },
+  );
   test('status requires both ACK and snapshot in either order', () async {
     await connect();
     transport.onCommand = (cmd) {

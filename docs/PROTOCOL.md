@@ -7,7 +7,7 @@ Commands: `{ "id": 1, "cmd": "status" }`. Replies include `{ "type":"ack", "id":
 
 Commands and fields:
 - `status`: status snapshot below.
-- `settings`: apply optional fields: start_min/end_min (0..1439, equal disables), interval_min (1..240), beep_type (0 off/1 single/2 double/3 long), dnd (bool), color/reminder_color/missing_color (24-bit RGB int), missing_sec (10..3600), beep_delay_sec (0..30), drink_grams (5..500), settle_ms (500..5000), presence_enabled (bool), tz_min (-720..840 multiple of 15). Validate entire request before persisting.
+- `settings`: apply optional fields: start_min/end_min (0..1439, equal disables), interval_min (1..240), beep_type (0 off/1 single/2 double/3 long), dnd (bool), color/reminder_color/missing_color (24-bit RGB int), missing_sec (10..3600), beep_delay_sec (0..30), drink_grams (5..500), settle_ms (500..5000), `presence_enabled` is read-only true (attempts to change it are rejected), tz_min (-720..840 multiple of 15). Validate entire request before persisting.
 - `wifi.scan`: discover nearby 2.4 GHz networks asynchronously without saving or connecting; correlated ACK and result. See [scan extension](WIFI_SCAN.md).
 - `wifi.add`: ssid (1..32 UTF-8 bytes), password (empty or 8..63 bytes). SSIDs and passwords may contain spaces. Up to four networks. Does not automatically discard the oldest: report error when full. Save then start async sync.
 - `wifi.remove`: ssid.
@@ -21,4 +21,4 @@ Status schema `{ "type":"status", "protocol":2, "firmware":"2.0.0", "ready":true
 
 Event: `{ "type":"event", "name":"drink|refill|lifted|returned|reminder|missing_alert|paused|scale_error", "ml":50 }`. No command IDs required.
 
-Presence: optionally gate all alerts on an active BLE app link (60-second disconnect grace, no boot grace). Default disabled to avoid silently suppressing hydration for users who close the app. UI must explain background/mobile limitations. A stored peer MAC alone is not presence. Automatic claim on app connection is prototype behavior, not secure ownership; no production security claim.
+Presence: ALWAYS gate both alert types on an active BLE app link (60-second disconnect grace, no boot grace). There is no writable toggle; `presence_enabled:true` is retained only as a read-only compatibility/diagnostic field. Old disabled NVS values are normalized without discarding other settings. UI must explain that closing/backgrounding the app can suppress reminders and that mobile background behavior needs real-device testing. A stored peer MAC alone is not presence. Automatic claim on app connection is prototype behavior, not secure ownership; no production security claim.

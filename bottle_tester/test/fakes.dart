@@ -13,7 +13,12 @@ const testBottle = ScannedBottle(
 Map<String, dynamic> deviceStatus() => {
   'type': 'status',
   'protocol': 2,
-  'firmware': '2.0.0',
+  'firmware': '2.1.0',
+  'presence_method': 'classic_remote_name',
+  'presence_state': 'present',
+  'presence_error': '',
+  'phone_name': 'Galaxy 水',
+  'app_peer_mac': '11:22:33:44:55:66',
   'ready': true,
   'clock_valid': true,
   'time_source': 'ntp',
@@ -47,7 +52,7 @@ Map<String, dynamic> deviceStatus() => {
     'beep_delay_sec': 3,
     'drink_grams': 15,
     'settle_ms': 1000,
-    'presence_enabled': false,
+    'presence_enabled': true,
     'tz_min': 330,
   },
   'networks': <Map<String, dynamic>>[],
@@ -185,8 +190,36 @@ class FakeTransport implements BottleTransport {
       status['tz_min'] = command['tz_min'];
     } else if (cmd == 'phone.clear') {
       status['phone_mac'] = null;
+      status['phone_name'] = null;
+      status['phone_present'] = false;
+      status['presence_state'] = 'not_configured';
+    } else if (cmd == 'phone.select') {
+      status['phone_mac'] = command['address'];
+      status['phone_name'] = 'Galaxy 水';
+      status['phone_present'] = false;
+      status['presence_state'] = 'checking';
     }
-    if (cmd == 'wifi.scan') {
+    if (cmd == 'phone.scan') {
+      emit({
+        'type': 'phone.scan',
+        'id': id,
+        'ok': true,
+        'devices': [
+          {'address': 'AA:BB:CC:DD:EE:FF', 'name': 'Galaxy 水', 'rssi': -40},
+          {'address': '22:33:44:55:66:77', 'name': '', 'rssi': -70},
+        ],
+        'truncated': false,
+      });
+    } else if (cmd == 'phone.probe') {
+      emit({
+        'type': 'phone.probe',
+        'id': id,
+        'ok': true,
+        'present': true,
+        'reason': 'reply',
+        'elapsed_ms': 400,
+      });
+    } else if (cmd == 'wifi.scan') {
       emit({
         'type': 'wifi.scan',
         'id': id,

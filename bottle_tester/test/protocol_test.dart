@@ -181,13 +181,23 @@ void main() {
       expect(BottleProtocol.validateSettings({'drink_grams': 15.5}), isNotNull);
       expect(BottleProtocol.validateSettings({'tz_min': 331}), isNotNull);
       expect(BottleProtocol.validateSettings({'dnd': 1}), isNotNull);
-      expect(
-        BottleProtocol.validateSettings({'presence_enabled': false}),
-        isNull,
-      );
+      expect(BottleProtocol.validateSettings({'dnd': false}), isNull);
+      expect(BottleProtocol.validateSettings({'dnd': true}), isNull);
       expect(BottleProtocol.validateSettings({'unexpected': 3}), isNotNull);
     },
   );
+  test('presence_enabled is read-only even when writing true', () {
+    for (final value in [false, true, 1, null]) {
+      expect(
+        BottleProtocol.validateSettings({'presence_enabled': value}),
+        'Unknown setting: presence_enabled',
+      );
+    }
+    final status = BottleStatus({
+      'settings': {'presence_enabled': true},
+    });
+    expect(status.settings['presence_enabled'], isTrue);
+  });
   test('NVS defaults and optional legacy keys are not faults', () {
     expect(
       const NvsEntry('start_min', 600, false).classification,

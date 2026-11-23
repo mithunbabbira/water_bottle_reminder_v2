@@ -295,7 +295,7 @@ class _SettingsEditorState extends State<SettingsEditor> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Presence and timezone are in Setup. The legacy “color” NVS field is shown in Advanced; reminder and missing-bottle colors are independently controlled here.',
+              'Always-on presence information and timezone are in Setup. The legacy “color” NVS field is shown in Advanced; reminder and missing-bottle colors are independently controlled here.',
             ),
           ],
           const SizedBox(height: 20),

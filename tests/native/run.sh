@@ -9,3 +9,8 @@ mkdir -p "$BUILD_DIR"
   -I "$ROOT/tests/native/stubs" -I "$ROOT/bottle" \
   "$ROOT/tests/native/core_test.cpp" -o "$BUILD_DIR/bottle_core_tests"
 "$BUILD_DIR/bottle_core_tests"
+"${CXX:-clang++}" -std=c++11 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -fno-omit-frame-pointer -pthread \
+  -I "$ROOT/tests/native/stubs" -I "$ROOT/bottle" \
+  "$ROOT/tests/native/classic_test.cpp" -o "$BUILD_DIR/classic_tests"
+"$BUILD_DIR/classic_tests"

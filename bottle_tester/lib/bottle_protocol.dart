@@ -47,7 +47,7 @@ class BottleProtocol {
 
   static String? validateSettings(Map<String, dynamic> fields) {
     for (final entry in fields.entries) {
-      if (entry.key == 'dnd' || entry.key == 'presence_enabled') {
+      if (entry.key == 'dnd') {
         if (entry.value is! bool) return '${entry.key} must be on or off.';
         continue;
       }
@@ -196,6 +196,63 @@ class WifiScanResult {
   late final int hiddenCount;
 }
 
+bool isClassicAddress(dynamic value) =>
+    value is String &&
+    RegExp(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$').hasMatch(value) &&
+    value != '00:00:00:00:00:00' &&
+    value != 'FF:FF:FF:FF:FF:FF';
+
+class ClassicPhone {
+  const ClassicPhone(this.address, this.name, this.rssi);
+  final String address;
+  final String name;
+  final int rssi;
+  String get label => name.isEmpty ? 'Unnamed Classic device' : name;
+}
+
+class PhoneScanResult {
+  PhoneScanResult.fromMessage(Map<String, dynamic> message) {
+    final entries = message['devices'];
+    if (entries is! List || message['truncated'] is! bool) {
+      throw const FormatException('Invalid Classic search result');
+    }
+    final unique = <String, ClassicPhone>{};
+    for (final entry in entries) {
+      if (entry is! Map ||
+          !isClassicAddress(entry['address']) ||
+          entry['name'] is! String ||
+          utf8.encode(entry['name'] as String).length > 48 ||
+          (entry['name'] as String).contains('\u0000') ||
+          (entry['name'] as String).runes.any(
+            (r) => r >= 0xd800 && r <= 0xdfff,
+          ) ||
+          entry['rssi'] is! int ||
+          entry['rssi'] < -127 ||
+          entry['rssi'] > 0) {
+        throw const FormatException('Invalid Classic device');
+      }
+      final phone = ClassicPhone(
+        entry['address'],
+        entry['name'],
+        entry['rssi'],
+      );
+      if (unique[phone.address] == null ||
+          phone.rssi > unique[phone.address]!.rssi) {
+        unique[phone.address] = phone;
+      }
+    }
+    final sorted = unique.values.toList()
+      ..sort((a, b) {
+        final signal = b.rssi.compareTo(a.rssi);
+        return signal == 0 ? a.address.compareTo(b.address) : signal;
+      });
+    devices = List.unmodifiable(sorted.take(8));
+    truncated = message['truncated'] == true || sorted.length > 8;
+  }
+  late final List<ClassicPhone> devices;
+  late final bool truncated;
+}
+
 class BottleStatus {
   BottleStatus(Map<String, dynamic> value) : data = Map.unmodifiable(value);
   final Map<String, dynamic> data;
@@ -222,6 +279,8 @@ class NvsEntry {
   static const requiredKeys = {'tare_offset', 'cal_factor'};
   static const optionalKeys = {
     'baseline_weight',
+    'classic_mac',
+    'classic_name',
     'ble_mac',
     'ble_irk',
     'sta_ssid',
@@ -239,6 +298,8 @@ class NvsEntry {
     'baseline_weight',
     'daily_total',
     'last_day',
+    'classic_mac',
+    'classic_name',
     'ble_mac',
     'ble_irk',
     'dnd',
@@ -278,6 +339,8 @@ class NvsEntry {
   String get classification {
     if (requiredMissing) return 'Setup required';
     if (stored) return 'Stored';
+    if (key == 'classic_mac') return 'Required for alerts · select a phone';
+    if (key == 'classic_name') return 'Optional display name';
     if (optionalKeys.contains(key) || key.startsWith('wifi_')) {
       return 'Optional / legacy';
     }

@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import 'bottle_protocol.dart';
 import 'bottle_transport.dart';
+import 'classic_discovery.dart';
 
 export 'bottle_transport.dart' show ScannedBottle;
 
@@ -25,6 +26,11 @@ class _Request {
   bool receivedStatus = false;
   bool nvsEnded = false;
   bool wifiScanReceived = false;
+  bool phoneReceived = false;
+  PhoneScanResult? phoneScan;
+  Map<String, dynamic>? probe;
+  String? probeTarget;
+  String? phoneError;
   WifiScanResult? wifiScan;
   String? wifiScanError;
   void maybeComplete() {
@@ -32,8 +38,11 @@ class _Request {
         acknowledged &&
         (command != 'status' || receivedStatus) &&
         (command != 'nvs' || nvsEnded) &&
-        (command != 'wifi.scan' || wifiScanReceived)) {
-      if (wifiScanError != null) {
+        (command != 'wifi.scan' || wifiScanReceived) &&
+        (!{'phone.scan', 'phone.probe'}.contains(command) || phoneReceived)) {
+      if (phoneError != null) {
+        fail(phoneError!);
+      } else if (wifiScanError != null) {
         fail(wifiScanError!);
       } else {
         done.complete();
@@ -50,13 +59,16 @@ class BottleBleController extends ChangeNotifier {
   BottleBleController({
     BottleTransport? transport,
     SessionStore? sessionStore,
+    ClassicDiscovery? classicDiscovery,
     this.ackTimeout = const Duration(seconds: 15),
     this.nvsTimeout = const Duration(seconds: 30),
     this.scanTimeout = const Duration(seconds: 25),
+    this.phoneTimeout = const Duration(seconds: 30),
     this.pollInterval = const Duration(seconds: 2),
     this.reconnectDelay = const Duration(seconds: 2),
   }) : _transport = transport ?? FlutterBottleTransport(),
-       _store = sessionStore ?? PreferencesSessionStore() {
+       _store = sessionStore ?? PreferencesSessionStore(),
+       _classicDiscovery = classicDiscovery ?? defaultClassicDiscovery() {
     _decoder = JsonLineDecoder(onMessage: _onMessage, onError: reportError);
     _subscriptions.add(
       _transport.notifications.listen(
@@ -86,9 +98,76 @@ class BottleBleController extends ChangeNotifier {
 
   final BottleTransport _transport;
   final SessionStore _store;
+  final ClassicDiscovery? _classicDiscovery;
+  bool get usesNativeClassicDiscovery => _classicDiscovery != null;
+  String? phoneDiscoverySource;
+  int _phoneSearchGeneration = 0;
+  Completer<void>? _nativeScanCancellation;
+
+  Future<void> _cancelNativeDiscovery() async {
+    final cancellation = _nativeScanCancellation;
+    if (cancellation != null && !cancellation.isCompleted) {
+      cancellation.complete();
+    }
+    try {
+      await _classicDiscovery?.cancel();
+    } catch (_) {
+      // Disconnect/dispose still invalidates all results, even if the platform
+      // channel is already closed. Native also owns an independent 30s deadline.
+    }
+  }
+
   final Duration ackTimeout;
   final Duration nvsTimeout;
   final Duration scanTimeout;
+  final Duration phoneTimeout;
+  bool phoneScanBusy = false;
+  bool phoneProbeBusy = false;
+  bool _phoneMutation = false;
+  int? phoneScanId;
+  List<ClassicPhone> phones = const [];
+  bool phoneScanTruncated = false;
+  String? phoneError;
+  String? _presenceOverride;
+  DateTime? _manualProbeAt;
+  String get presenceState {
+    if (!isConnected || snapshot == null) return 'unknown';
+    if (_presenceOverride == 'present' &&
+        _manualProbeAt != null &&
+        DateTime.now().difference(_manualProbeAt!) >=
+            const Duration(seconds: 30)) {
+      return 'unknown';
+    }
+    if (_presenceOverride != null) return _presenceOverride!;
+    if (stale) return 'unknown';
+    // Never interpret legacy BLE peer/link status as Classic presence.
+    if (snapshot!.text('presence_method') != 'classic_remote_name') {
+      return 'unknown';
+    }
+    if (!isClassicAddress(snapshot!.data['phone_mac'])) return 'not_configured';
+    final state = snapshot!.text('presence_state', 'unknown');
+    final age = snapshot!.number('presence_last_check_age_sec');
+    if (state == 'present' && age != null && age >= 30) return 'unknown';
+    return state == 'present' && !snapshot!.flag('phone_present')
+        ? 'unknown'
+        : state;
+  }
+
+  void _resetPhones() {
+    ++_phoneSearchGeneration;
+    phoneDiscoverySource = null;
+    unawaited(_cancelNativeDiscovery());
+    _phoneMutation = false;
+    _manualProbeAt = null;
+    phoneScanBusy = false;
+    phoneProbeBusy = false;
+    phoneScanId = null;
+    phones = const [];
+    phoneScanTruncated = false;
+    phoneError = null;
+    _presenceOverride = null;
+  }
+
   final Duration pollInterval;
   final Duration reconnectDelay;
   final List<StreamSubscription<dynamic>> _subscriptions = [];
@@ -130,7 +209,8 @@ class BottleBleController extends ChangeNotifier {
   _Request? _request;
   Timer? _poll;
   Timer? _reconnect;
-  bool get busy => _pending > 0 || connecting || scanBusy;
+  bool get busy =>
+      _pending > 0 || connecting || scanBusy || phoneScanBusy || phoneProbeBusy;
   bool get isConnected => connected != null;
   bool get stale =>
       isConnected &&
@@ -245,6 +325,7 @@ class BottleBleController extends ChangeNotifier {
     nvsEntries.clear();
     nvsComplete = false;
     _resetWifiScan();
+    _resetPhones();
     _decoder.reset();
     _notify();
     try {
@@ -322,6 +403,7 @@ class BottleBleController extends ChangeNotifier {
           : 'Connection closed. Changes may not have been saved; read status after reconnecting.',
     );
     _resetWifiScan();
+    _resetPhones();
     if (searching) {
       scanError = 'Wi-Fi search stopped because Bluetooth disconnected. Reconnect and search again.';
     }
@@ -371,17 +453,24 @@ class BottleBleController extends ChangeNotifier {
         throw const BottleCommandException('Connect to your bottle first.');
       }
       final request = _Request(_nextId++, command);
+      if (command == 'phone.probe') {
+        request.probeTarget = snapshot?.text('phone_mac');
+      }
       final payload = BottleProtocol.encode(request.id, command, data);
       _request = request;
       // Install error handling before the first write (a synchronous ACK is valid).
       final completion = request.done.future.timeout(
-        command == 'wifi.scan'
+        {'phone.scan', 'phone.probe', 'phone.select'}.contains(command)
+            ? phoneTimeout
+            : command == 'wifi.scan'
             ? scanTimeout
             : command == 'nvs'
             ? nvsTimeout
             : ackTimeout,
         onTimeout: () => throw BottleCommandException(
-          command == 'wifi.scan'
+          command.startsWith('phone.')
+              ? 'Classic phone operation timed out after 30 seconds. Reconnect or retry; presence is unconfirmed.'
+              : command == 'wifi.scan'
               ? 'Wi-Fi search timed out. Move the bottle closer to your 2.4 GHz router and retry.'
               : 'Bottle did not acknowledge in time. Changes are unconfirmed. Refresh or reconnect before retrying.',
         ),
@@ -408,6 +497,27 @@ class BottleBleController extends ChangeNotifier {
               .timeout(ackTimeout);
         }
         await completion;
+        if (generation == _generation && isConnected && !_disposed) {
+          if (command == 'phone.scan') {
+            phones = request.phoneScan!.devices;
+            phoneScanTruncated = request.phoneScan!.truncated;
+            phoneScanId = request.id;
+            phoneDiscoverySource = 'esp_classic';
+          } else if (command == 'phone.probe') {
+            if (request.probeTarget != snapshot?.text('phone_mac')) {
+              throw const BottleCommandException(
+                'Selected Classic phone changed during check. Check the new target again.',
+              );
+            }
+            final result = request.probe!;
+            _manualProbeAt = DateTime.now();
+            _presenceOverride = result['present'] == true
+                ? 'present'
+                : {'timeout', 'radio_error'}.contains(result['reason'])
+                ? result['reason'] as String
+                : 'away';
+          }
+        }
         if (command == 'wifi.scan' &&
             generation == _generation &&
             isConnected &&
@@ -503,6 +613,7 @@ class BottleBleController extends ChangeNotifier {
     }
     final generation = _generation;
     _resetWifiScan();
+    _resetPhones();
     scanBusy = true;
     bannerError = null;
     notice = null;
@@ -538,7 +649,233 @@ class BottleBleController extends ChangeNotifier {
   Future<void> removeWifi(String ssid) =>
       _mutate('wifi.remove', {'ssid': ssid});
   Future<void> syncWifi() => _mutate('wifi.sync');
-  Future<void> clearPhone() => _mutate('phone.clear');
+  Future<void> scanPhones() async {
+    if (!isConnected || busy || wifiTimeBusy) {
+      return _reject(
+        'Connect and wait for the current bottle operation before searching phones.',
+      );
+    }
+    final generation = _generation;
+    final searchGeneration = ++_phoneSearchGeneration;
+    phoneScanId = null;
+    phoneDiscoverySource = null;
+    phones = const [];
+    phoneScanTruncated = false;
+    phoneError = null;
+    bannerError = null;
+    notice = null;
+    phoneScanBusy = true;
+    final discovery = _classicDiscovery;
+    final cancellation = discovery == null ? null : Completer<void>();
+    _nativeScanCancellation = cancellation;
+    _notify();
+    try {
+      if (discovery == null) {
+        await sendCommand('phone.scan');
+      } else {
+        // Local ID validates this completed inquiry only. It is NOT an ESP
+        // scan_id and must never be serialized as one in phone.select.
+        final id = _nextId++;
+        final message =
+            await Future.any<Map<String, dynamic>>([
+              discovery.scan(id),
+              cancellation!.future.then(
+                (_) => throw const BottleCommandException(
+                  'Mac Classic search cancelled because the connection closed.',
+                ),
+              ),
+            ]).timeout(
+              phoneTimeout,
+              onTimeout: () => throw const BottleCommandException(
+                'Mac Classic search timed out after 30 seconds. Open phone Bluetooth settings and retry.',
+              ),
+            );
+        if (_disposed ||
+            generation != _generation ||
+            searchGeneration != _phoneSearchGeneration ||
+            !isConnected) {
+          throw const BottleCommandException(
+            'Mac Classic search expired. Connect and search again.',
+          );
+        }
+        if (message['id'] != id ||
+            message['discovery_source'] != 'mac_classic' ||
+            message['ok'] != true) {
+          throw const BottleCommandException(
+            'Mac Classic search returned a wrong, stale or failed result. Search again.',
+          );
+        }
+        final result = PhoneScanResult.fromMessage(message);
+        phones = result.devices;
+        phoneScanTruncated = result.truncated;
+        phoneScanId = id;
+        phoneDiscoverySource = 'mac_classic';
+      }
+    } catch (error) {
+      if (!_disposed &&
+          generation == _generation &&
+          searchGeneration == _phoneSearchGeneration) {
+        phoneError = error is FormatException
+            ? 'Mac Classic search returned malformed devices. Search again.'
+            : safeText(error.toString());
+        reportError(phoneError!);
+      }
+      rethrow;
+    } finally {
+      if (identical(_nativeScanCancellation, cancellation) &&
+          cancellation != null) {
+        await _cancelNativeDiscovery();
+        _nativeScanCancellation = null;
+      }
+      if (generation == _generation &&
+          searchGeneration == _phoneSearchGeneration) {
+        phoneScanBusy = false;
+      }
+      _notify();
+    }
+  }
+
+  /// UI must explicitly confirm the exact discovered identity before calling.
+  Future<void> selectPhone(String address, int scanId) async {
+    if (!isClassicAddress(address) ||
+        phoneScanId != scanId ||
+        !phones.any((p) => p.address == address) ||
+        busy ||
+        !isConnected) {
+      return _reject(
+        'Select a phone from the current completed search. Search again if it expired.',
+      );
+    }
+    final native = phoneDiscoverySource == 'mac_classic';
+    final phone = phones.firstWhere((p) => p.address == address);
+    final generation = _generation;
+    _presenceOverride = 'checking';
+    _phoneMutation = true;
+    _notify();
+    try {
+      await _mutate(
+        'phone.select',
+        native
+            ? {
+                'address': address,
+                'name': phone.name,
+                'discovery_source': 'mac_classic',
+              }
+            : {'address': address, 'scan_id': scanId},
+      );
+      if (_disposed || generation != _generation || !isConnected) {
+        throw const BottleCommandException(
+          'Selection is unconfirmed after connection loss. Reconnect and read status.',
+        );
+      }
+      if (snapshot?.text('phone_mac') != address ||
+          snapshot?.text('presence_method') != 'classic_remote_name') {
+        await _reject(
+          'Classic phone save is unconfirmed: readback did not match. Refresh and retry.',
+        );
+      }
+      _presenceOverride = null;
+      notice = native
+          ? 'Bottle verified this exact Classic phone live and saved it; identity confirmed by readback. Later alerts still require fresh checks.'
+          : 'Selected Classic phone verified in bottle readback. Reachability is checked separately.';
+    } catch (_) {
+      if (generation == _generation) _presenceOverride = 'unknown';
+      rethrow;
+    } finally {
+      if (generation == _generation) _phoneMutation = false;
+      _notify();
+    }
+  }
+
+  /// Explicit manual fallback. The bottle verifies a fresh Classic response before saving.
+  Future<void> selectPhoneManually(String rawAddress) async {
+    final address = rawAddress.trim().replaceAll('-', ':').toUpperCase();
+    if (!isClassicAddress(address) || busy || !isConnected || wifiTimeBusy) {
+      return _reject('Enter a valid Classic Bluetooth address (AA:BB:CC:DD:EE:FF), connect and wait for other operations.');
+    }
+    final generation = _generation;
+    _presenceOverride = 'checking';
+    _phoneMutation = true;
+    _notify();
+    try {
+      await _mutate('phone.select', {
+        'address': address,
+        'name': 'My phone',
+        'discovery_source': 'manual',
+      });
+      if (_disposed || generation != _generation || !isConnected ||
+          snapshot?.text('phone_mac') != address ||
+          snapshot?.text('presence_method') != 'classic_remote_name') {
+        throw const BottleCommandException('Save unconfirmed. Reconnect and check the selected phone.');
+      }
+      _presenceOverride = null;
+      notice = 'The bottle verified your phone and saved its address.';
+    } catch (_) {
+      if (generation == _generation) _presenceOverride = 'unknown';
+      rethrow;
+    } finally {
+      if (generation == _generation) _phoneMutation = false;
+      _notify();
+    }
+  }
+
+  Future<void> probePhone() async {
+    if (!isConnected ||
+        busy ||
+        wifiTimeBusy ||
+        !isClassicAddress(snapshot?.data['phone_mac']) ||
+        snapshot?.text('presence_method') != 'classic_remote_name') {
+      return _reject(
+        'Select a Classic phone first and wait for the current bottle operation.',
+      );
+    }
+    final generation = _generation;
+    phoneProbeBusy = true;
+    phoneError = null;
+    bannerError = null;
+    _presenceOverride = 'checking';
+    _notify();
+    try {
+      await sendCommand('phone.probe');
+      if ({'timeout', 'radio_error'}.contains(_presenceOverride)) {
+        phoneError =
+            'Classic phone check: $_presenceOverride. Wait for radio activity to finish, then retry.';
+        reportError(phoneError!);
+      }
+    } catch (error) {
+      if (generation == _generation) {
+        phoneError = error.toString();
+        _presenceOverride = error.toString().contains('timed out')
+            ? 'timeout'
+            : 'unknown';
+      }
+      rethrow;
+    } finally {
+      if (generation == _generation) phoneProbeBusy = false;
+      _notify();
+    }
+  }
+
+  Future<void> clearPhone() async {
+    _phoneMutation = true;
+    _presenceOverride = 'unknown';
+    _notify();
+    try {
+      await _mutate('phone.clear');
+      if (snapshot?.data['phone_mac'] != null) {
+        await _reject('Classic phone clear is unconfirmed. Refresh and retry.');
+      }
+      _presenceOverride = 'not_configured';
+      phoneScanId = null;
+      phones = const [];
+      notice =
+          'Classic phone cleared and verified. Alerts need a selected phone.';
+    } finally {
+      _phoneMutation = false;
+      _notify();
+    }
+  }
+
   Future<void> tare() => _mutate('tare');
   Future<void> calibrate(double grams) async {
     if (!grams.isFinite || grams <= 0) {
@@ -603,6 +940,40 @@ class BottleBleController extends ChangeNotifier {
         request.acknowledged = true;
         request.maybeComplete();
       }
+    } else if (type == 'phone.scan' || type == 'phone.probe') {
+      if (request == null ||
+          request.command != type ||
+          message['id'] != request.id ||
+          request.phoneReceived ||
+          request.done.isCompleted) {
+        return;
+      }
+      request.phoneReceived = true;
+      try {
+        if (message['ok'] != true) {
+          throw const FormatException('Classic operation failed');
+        }
+        if (type == 'phone.scan') {
+          request.phoneScan = PhoneScanResult.fromMessage(message);
+        } else {
+          if (message['present'] is! bool ||
+              !{
+                'reply',
+                'no_reply',
+                'timeout',
+                'radio_error',
+              }.contains(message['reason']) ||
+              message['elapsed_ms'] is! int ||
+              message['elapsed_ms'] < 0 ||
+              (message['present'] == true && message['reason'] != 'reply')) {
+            throw const FormatException('Invalid probe result');
+          }
+          request.probe = Map.of(message);
+        }
+      } on FormatException {
+        request.phoneError = 'Classic phone operation failed or returned an invalid result. Retry after radio activity finishes.';
+      }
+      request.maybeComplete();
     } else if (type == 'wifi.scan') {
       if (request == null ||
           request.command != 'wifi.scan' ||
@@ -633,6 +1004,7 @@ class BottleBleController extends ChangeNotifier {
         );
         return;
       }
+      if (!phoneProbeBusy && !_phoneMutation) _presenceOverride = null;
       final previousWifi = snapshot?.text('wifi_state');
       final previousStorageFault = snapshot?.data['storage_fault'] == true;
       snapshot = BottleStatus(
@@ -728,6 +1100,7 @@ class BottleBleController extends ChangeNotifier {
     _reconnect?.cancel();
     _request?.fail('Controller disposed.');
     _resetWifiScan();
+    _resetPhones();
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }

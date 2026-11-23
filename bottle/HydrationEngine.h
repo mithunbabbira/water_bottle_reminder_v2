@@ -16,7 +16,6 @@ struct HydrationSettings {
   uint32_t missingColor = 0xff0000u;
   uint8_t beepType = 2;
   bool dnd = false;
-  bool presenceEnabled = false;
 };
 
 struct HydrationInput {
@@ -27,7 +26,7 @@ struct HydrationInput {
   bool clockValid = false;
   bool activeWindow = false;
   int32_t day = 0;
-  bool phoneHere = true;
+  bool phoneHere = false; // Fresh automatic episode authorization, NEVER a BLE link.
 };
 
 struct HydrationFrame {
@@ -62,11 +61,11 @@ class HydrationEngine {
     }
     rollDay(in);
     quiet_ = !in.clockValid || !in.activeWindow;
-    away_ = settings.presenceEnabled && !in.phoneHere;
+    away_ = !in.phoneHere; // mandatory for every alert; never bypassed by settings/NVS
     const bool allowed = !quiet_ && !away_;
     if (!allowed && (reminder_ || missingAlert_)) events_ |= Paused;
     if (!allowed) {
-      reminder_ = false; missingAlert_ = false; flash_ = false;
+      reminder_ = false; missingAlert_ = false; // Drink feedback is not a presence-gated nag.
     }
 
     // A cached sample can keep the scale healthy, but can NEVER serve as another
@@ -177,6 +176,16 @@ class HydrationEngine {
   float lastDrinkMl() const { return lastDrinkMl_; }
   bool missing() const { return missing_; }
   bool alerting() const { return reminder_ || missingAlert_; }
+  // Independent of phoneHere: the orchestrator must discover due episodes while
+  // outputs are suppressed, and obtain a NEW automatic result for that episode.
+  bool needsPresence(uint32_t now) const {
+    if (!bootReady_ || scaleError_ || quiet_ || !haveSequence_ ||
+        elapsed(now, lastFreshMs_) > kSampleMaxAgeMs) return false;
+    if (missing_) return missingVerified_ && !provisionalReturn_ &&
+                         (missingAlert_ || elapsed(now, missingMs_) >= settings_.missingMs);
+    return hasBaseline_ && !provisionalLift_ && !settling_ && !confirming_ && !retry_ &&
+           (reminderDue_ || reminder_);
+  }
   bool scaleError() const { return scaleError_; }
   bool persistenceDirty() const { return persistenceDirty_; }
   void persisted() { persistenceDirty_ = false; }
@@ -354,6 +363,9 @@ class HydrationEngine {
     if (quiet_) { frame_.color = kQuietColor; return; }
     if (provisionalLift_ || provisionalReturn_) return;
     if (missing_ && !missingAlert_) return;
+    // Physical drink confirmation remains visible even without alert permission.
+    if (flash_ && elapsed(now, flashMs_) < kFlashMs) { frame_.color = kDrinkColor; return; }
+    flash_ = false;
     if (!allowed) { frame_.color = settings_.idleColor; return; }
     if (reminder_ || missingAlert_) {
       const bool on = (elapsed(now, alertMs_) / kBlinkMs) % 2 == 0;
@@ -362,8 +374,6 @@ class HydrationEngine {
       frame_.beep = !on && !settings_.dnd && settings_.beepType != 0 && elapsed(now, alertMs_) >= settings_.beepDelayMs;
       return;
     }
-    if (flash_ && elapsed(now, flashMs_) < kFlashMs) { frame_.color = kDrinkColor; return; }
-    flash_ = false;
     frame_.color = settings_.idleColor;
   }
 };

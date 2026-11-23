@@ -2,9 +2,11 @@ import 'dart:async';
 
 import 'package:material_ui/material_ui.dart';
 
+import 'action_confirmation.dart';
 import 'bottle_ble_controller.dart';
 import 'bottle_protocol.dart';
 import 'settings_editor.dart';
+import 'phone_setup.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -297,7 +299,7 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
                         final approved = await confirmAction(
                           context,
                           title: 'Connect to ${device.name}?',
-                          message: 'This prototype automatically remembers the connecting phone as its peer. Only connect to a bottle you intend to use. This is not secure ownership or passive phone detection.',
+                          message: 'Connect for configuration only. The app BLE link is not phone presence and never selects a Classic phone. Only connect to a bottle you intend to configure.',
                           confirmLabel: 'Connect',
                         );
                         if (approved) await _run(() => c.connect(device));
@@ -404,15 +406,7 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
                 child: InfoCard(
                   title: 'Next check',
                   icon: Icons.schedule,
-                  child: Text(
-                    s == null
-                        ? '—'
-                        : !s.flag('active')
-                        ? 'Outside the active window or paused'
-                        : s.number('next_check_sec') == null
-                        ? 'Waiting for device'
-                        : 'In ${(s.number('next_check_sec')! / 60).ceil()} min',
-                  ),
+                  child: Text(_nextCheckLabel(c, s)),
                 ),
               ),
             ],
@@ -440,30 +434,31 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
           ],
         ),
       ),
-      if (s != null)
-        InfoCard(
-          title: 'At a glance',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
+      InfoCard(
+        title: 'At a glance',
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (s != null) ...[
               Text(
                 'Clock: ${s.flag('clock_valid') ? 'ready' : 'needs sync'} · ${_sourceLabel(s.text('time_source'))}',
               ),
               const SizedBox(height: 8),
               Text('Internet time: ${s.text('wifi_state')}'),
               const SizedBox(height: 8),
-              Text(
-                s.settings['presence_enabled'] == true
-                    ? 'Presence gate on · active BLE link ${s.flag('phone_present') ? 'present' : 'not present'}'
-                    : 'Presence gate off · reminders do not require the app',
-              ),
-              TextButton(
-                onPressed: () => setState(() => _page = 1),
-                child: const Text('Review setup'),
-              ),
             ],
-          ),
+            const Text(
+              'Presence is always on · alerts require fresh selected-phone Classic reachability, not an app connection.',
+            ),
+            const SizedBox(height: 8),
+            Text(presenceLabel(c)),
+            TextButton(
+              onPressed: () => setState(() => _page = 1),
+              child: const Text('Review setup'),
+            ),
+          ],
         ),
+      ),
     ];
   }
 
@@ -538,35 +533,9 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
         ),
       ),
       InfoCard(
-        title: '4  Optional: reminders only while nearby',
+        title: '4  Select your Classic phone',
         icon: Icons.phonelink_ring_outlined,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Presence uses a real active BLE app connection—not a saved MAC or a fake ping. With the gate on, alerts stop 60 seconds after disconnecting. There is no startup grace period. Closing the app or OS background restrictions can suppress reminders. Leave this off for standalone use.',
-            ),
-            const SizedBox(height: 12),
-            SwitchListTile.adaptive(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Require active app link for alerts'),
-              subtitle: Text(
-                s?.settings['presence_enabled'] == null
-                    ? 'Not yet reported by device'
-                    : s!.settings['presence_enabled'] == true
-                    ? 'Enabled on bottle'
-                    : 'Disabled on bottle (recommended)',
-              ),
-              value: s?.settings['presence_enabled'] == true,
-              onChanged:
-                  !c.isConnected ||
-                      c.busy ||
-                      s?.settings['presence_enabled'] == null
-                  ? null
-                  : (v) => _run(() => c.saveSettings({'presence_enabled': v})),
-            ),
-          ],
-        ),
+        child: PhoneSetup(controller: c),
       ),
     ];
   }
@@ -586,10 +555,15 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
           Text(
             'Raw scale: ${c.snapshot?.text('raw', '—') ?? '—'} · baseline: ${c.snapshot?.text('baseline_g', '—') ?? '—'} g',
           ),
-          Text('Peer: ${c.snapshot?.text('phone_mac', 'none') ?? '—'}'),
+          Text(
+            'Selected Classic: ${c.snapshot?.text('phone_mac', 'none') ?? '—'}',
+          ),
+          Text(
+            'App BLE peer (diagnostic): ${c.snapshot?.text('app_peer_mac', 'none') ?? '—'}',
+          ),
           const SizedBox(height: 8),
           const Text(
-            'Peer address is diagnostic only. This prototype captures the phone peer on every app connection; it is not secure ownership. A stored address is not proof of presence.',
+            'The app BLE peer is diagnostic only, separate from the selected Classic identity. Saving an identity is not proof of reachability.',
           ),
           TextButton(
             onPressed: !c.isConnected || c.busy
@@ -597,14 +571,14 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
                 : () async {
                     if (await confirmAction(
                       context,
-                      title: 'Clear saved peer?',
-                      message: 'The peer will be captured again on the next app connection. This does not disable the presence gate.',
-                      confirmLabel: 'Clear peer',
+                      title: 'Clear selected Classic phone?',
+                      message: 'Remove the saved Classic target and invalidate its presence. Alerts stay suppressed until you explicitly select another phone. The diagnostic BLE peer, networks and calibration are kept.',
+                      confirmLabel: 'Clear Classic phone',
                     )) {
                       await _run(c.clearPhone);
                     }
                   },
-            child: const Text('Clear saved peer'),
+            child: const Text('Clear selected Classic phone'),
           ),
         ],
       ),
@@ -615,7 +589,7 @@ class _BottlePageState extends State<BottlePage> with WidgetsBindingObserver {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text(
-            'Stored = persisted in flash. Firmware default = usable without a saved override; not a fault. Scale tare/calibration are the only required setup values. Wi-Fi, peer identity, baseline and legacy portal keys are optional. Secrets are never shown.',
+            'Stored = persisted in flash. Firmware default = usable without an override. Scale tare/calibration need setup; classic_mac is required for alerts and classic_name is optional. BLE peer, Wi-Fi, baseline and legacy keys are diagnostic/optional, never presence. Secrets are never shown.',
           ),
           const SizedBox(height: 12),
           Align(
@@ -767,31 +741,6 @@ class InfoCard extends StatelessWidget {
   );
 }
 
-Future<bool> confirmAction(
-  BuildContext context, {
-  required String title,
-  required String message,
-  required String confirmLabel,
-}) async =>
-    await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(title),
-        content: SingleChildScrollView(child: Text(message)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: Text(confirmLabel),
-          ),
-        ],
-      ),
-    ) ??
-    false;
-
 class CalibrationDialog extends StatefulWidget {
   const CalibrationDialog({super.key, required this.controller});
   final BottleBleController controller;
@@ -906,6 +855,31 @@ String _stateLabel(String state) => switch (state) {
   'scale_error' => 'Scale needs attention',
   _ => state,
 };
+
+/// Prefer the countdown whenever the bottle reports one. Presence freshness is
+/// checked automatically when an alert is due; it should not hide the schedule.
+String _nextCheckLabel(BottleBleController c, BottleStatus? s) {
+  if (s == null) return 'Waiting for app connection';
+  final seconds = s.number('next_check_sec');
+  final countdown = seconds == null
+      ? null
+      : 'In ${(seconds / 60).ceil().clamp(0, 9999)} min';
+  if (!isClassicAddress(s.data['phone_mac'])) {
+    return countdown == null
+        ? 'Select a Classic phone in Setup'
+        : '$countdown · select a Classic phone in Setup';
+  }
+  if (!s.flag('active')) {
+    return countdown == null
+        ? 'Outside the active window'
+        : '$countdown · outside the active window';
+  }
+  if (countdown == null) return 'Waiting for device';
+  if (c.presenceState == 'not_configured') {
+    return '$countdown · select a Classic phone in Setup';
+  }
+  return countdown;
+}
 
 class TimeSetup extends StatefulWidget {
   const TimeSetup({super.key, required this.controller});

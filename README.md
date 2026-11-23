@@ -29,9 +29,11 @@ Totals reset on the next valid local day. Weight differences are estimates, not 
 
 ## Presence: important phone limitation
 
-The peer BLE address is automatically saved on app connection and replaced by the next connected app, as requested for this prototype. It is visible in diagnostics. **A stored MAC is not reliable passive phone presence:** iOS/Android rotate private addresses and usually do not accept incoming BLE connections.
+In **Setup → Search phones**, select your own Bluetooth Classic device by name and confirm it. The phone may need its Bluetooth settings screen open for initial discovery. The selected Classic address/name are saved atomically on the bottle, separately from the app's BLE peer address. Opening the Mac app does not silently replace the selected phone. There is no normal-use MAC entry field.
 
-Optional presence gating therefore uses the actual app connection, with 60 seconds of disconnect grace and no pretend boot presence. Leave the app connected for this mode. Mobile background execution/reconnection depends on OS policy and needs device-specific testing. Presence gating is **off by default** so closing the app does not silently stop water reminders. It is not evidence that the person is physically at home (a stationary laptop can stay connected).
+Presence gating is **mandatory** for both alert types. When an alert becomes due, the bottle makes an asynchronous **Bluetooth Classic remote-name request** to the selected device before allowing the alert. It checks again every 15 seconds while an alert remains due/active; failed or expired checks suppress alerts. Each new alert episode requires a new automatic check—an earlier manual test is not authorization. No selected device means no reminders and an actionable setup message. There is no toggle or app-link grace policy.
+
+The phone app does not need to be running for this method; the phone's Bluetooth must remain enabled and reachable. The app's BLE link is only for configuration/diagnostics, never proof of presence. BLE private addresses are not migrated into Classic identity. Samsung S25 Ultra direct Classic replies with the phone locked/app closed were demonstrated in the lab; integration results and remaining iPhone/long-idle validation are recorded in `docs/TEST_RESULTS.md`. This detects the selected device nearby, not whether a person is physically home; selecting a stationary Mac will detect that Mac.
 
 ## Hardware
 

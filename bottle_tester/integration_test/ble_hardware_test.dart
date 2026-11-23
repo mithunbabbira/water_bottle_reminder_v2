@@ -6,6 +6,10 @@
 //   --dart-define=HARDWARE_TEST=true
 // Optional: --dart-define=BOTTLE_DEVICE_ID=<exact platform ID>
 // Optional reversible mutation: --dart-define=MUTATE_DEVICE=true
+// Classic selection is OFF by default; discovery NEVER picks an identity.
+// Intentional persistent replacement requires BOTH:
+// --dart-define=SELECT_CLASSIC_PHONE=true
+// --dart-define=CLASSIC_PHONE_ADDRESS=AA:BB:CC:DD:EE:FF
 
 import 'package:bottle_tester/bottle_ble_controller.dart';
 import 'package:bottle_tester/bottle_protocol.dart';
@@ -25,6 +29,8 @@ void main() {
   const enabled = bool.fromEnvironment('HARDWARE_TEST');
   const mutate = bool.fromEnvironment('MUTATE_DEVICE');
   const requestedId = String.fromEnvironment('BOTTLE_DEVICE_ID');
+  const selectClassic = bool.fromEnvironment('SELECT_CLASSIC_PHONE');
+  const classicAddress = String.fromEnvironment('CLASSIC_PHONE_ADDRESS');
 
   testWidgets(
     'real app transport ↔ bottle protocol v2',
@@ -137,6 +143,50 @@ void main() {
             wifiStorage,
             reason: 'Searching must not modify saved credentials.',
           );
+
+          // Read-only Classic discovery: NEVER select the first/random result.
+          final originalClassic = controller.snapshot!.data['phone_mac'];
+          await controller.scanPhones();
+          expect(controller.phoneScanId, isNotNull);
+          expect(controller.phones.length, lessThanOrEqualTo(8));
+          await controller.refreshStatus();
+          expect(controller.snapshot!.data['phone_mac'], originalClassic);
+          if (selectClassic) {
+            expect(
+              isClassicAddress(classicAddress),
+              isTrue,
+              reason: 'Explicit selection also requires exact CLASSIC_PHONE_ADDRESS.',
+            );
+            expect(
+              controller.phones
+                  .where((p) => p.address == classicAddress)
+                  .length,
+              1,
+              reason: 'The exact opted-in Classic identity must be in this completed discovery. Never fall back to another phone.',
+            );
+            await controller.selectPhone(
+              classicAddress,
+              controller.phoneScanId!,
+            );
+            expect(controller.snapshot!.text('phone_mac'), classicAddress);
+          }
+          if (isClassicAddress(controller.snapshot!.data['phone_mac'])) {
+            // The automatic post-selection probe may still own the radio.
+            for (
+              var attempt = 0;
+              controller.snapshot!.text('presence_state') == 'checking' &&
+                  attempt < 30;
+              attempt++
+            ) {
+              await Future<void>.delayed(const Duration(seconds: 1));
+              await controller.refreshStatus();
+            }
+            await controller.probePhone();
+            expect(
+              controller.presenceState,
+              anyOf('present', 'away', 'timeout', 'radio_error'),
+            );
+          }
 
           // Unknown command must be rejected by a correlated negative ACK;
           // a transport timeout is NOT a passing rejection.

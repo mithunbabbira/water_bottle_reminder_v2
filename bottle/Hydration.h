@@ -32,7 +32,6 @@ class Hydration {
     settings.missingColor = nvm.data.missingColor;
     settings.beepType = nvm.data.beepType;
     settings.dnd = nvm.data.dnd;
-    settings.presenceEnabled = nvm.data.presenceEnabled;
     HydrationInput input;
     input.scaleValid = nvm.data.hasTare && nvm.data.hasCal && !scale.busy() &&
                        scale.latestGrams(&input.grams, SAMPLE_MAX_AGE_MS);
@@ -79,6 +78,7 @@ class Hydration {
   float dailyMl() const { return engine_.dailyMl(); }
   bool missing() const { return engine_.missing(); }
   bool alerting() const { return engine_.alerting(); }
+  bool needsPresence(uint32_t now) const { return engine_.needsPresence(now); }
   bool hasLastDrink() const { return engine_.hasLastDrink(); }
   float lastDrinkMl() const { return engine_.lastDrinkMl(); }
   bool ready() const { return engine_.ready(); }

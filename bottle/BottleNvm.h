@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <math.h>
 #include <string.h>
+#include "ClassicText.h"
 
 static const char *BOTTLE_NVS_NS = "bottle";
 static const uint8_t BOTTLE_SCHEMA_VER = 2;
@@ -33,6 +34,9 @@ struct BottleNvmData {
   int32_t lastDay = 0;
   bool hasBleMac = false;
   uint8_t bleMac[6] = {};
+  bool hasClassicPhone = false;
+  uint8_t classicMac[6] = {};
+  char classicName[49] = {};
   bool hasIrk = false;
   uint8_t irk[16] = {};
 
@@ -45,7 +49,7 @@ struct BottleNvmData {
   uint8_t beepDelaySec = 5;
   uint16_t drinkGrams = 50, settleMs = 2000;
   uint32_t reminderColor = 0x00ffffu, missingColor = 0xff0000u;
-  bool presenceEnabled = false;
+  bool presenceEnabled = true; // read-only compatibility field; policy is always enforced
 
   char staSsid[BOTTLE_SSID_LEN] = {};
   char staPass[BOTTLE_PASS_LEN] = {};
@@ -66,6 +70,9 @@ class BottleNvm {
   // diagnostics of corrupt legacy values use stored() + settingUsable().
   bool stored(const char *key) {
     if (key == nullptr) return false;
+    // Never interpret old aliases or BLE identities as a selected Classic target.
+    if (strcmp(key, "classic_mac") == 0 || strcmp(key, "classic_name") == 0)
+      return classicBlob_ && data.hasClassicPhone;
     if (isSetting(key) && settingsBlob_) return true;
     if (peerBlob_ && strcmp(key, "ble_mac") == 0) return data.hasBleMac;
     if (peerBlob_ && strcmp(key, "ble_irk") == 0) return data.hasIrk;
@@ -95,7 +102,7 @@ class BottleNvm {
 
   void load() {
     data = BottleNvmData();
-    settingsBlob_ = hydrationBlob_ = networksBlob_ = peerBlob_ = false;
+    settingsBlob_ = hydrationBlob_ = networksBlob_ = peerBlob_ = classicBlob_ = false;
     legacyUsable_ = 0;
     if (prefs_.getUChar("schema", 0) != BOTTLE_SCHEMA_VER) prefs_.putUChar("schema", BOTTLE_SCHEMA_VER);
     data.hasTare = prefs_.isKey("tare_offset");
@@ -116,6 +123,7 @@ class BottleNvm {
     data.hasIrk = prefs_.getBytes("ble_irk", data.irk, sizeof(data.irk)) == sizeof(data.irk);
     if (!data.hasIrk) memset(data.irk, 0, sizeof(data.irk));
     loadPeer();
+    loadClassic();
 
     loadLegacySettings();
     if (!loadSettings() && legacyUsable_ != 0) {
@@ -134,7 +142,7 @@ class BottleNvm {
   static bool validSettings(const BottleNvmData &d) {
     return d.startMin < 1440 && d.endMin < 1440 && d.intervalMin >= 1 && d.intervalMin <= 240 &&
            d.beepType <= BEEP_LONG && d.tzMin >= -720 && d.tzMin <= 840 && d.tzMin % 15 == 0 &&
-           d.missingSec >= 10 && d.missingSec <= 3600 && d.beepDelaySec <= 30 &&
+           d.presenceEnabled && d.missingSec >= 10 && d.missingSec <= 3600 && d.beepDelaySec <= 30 &&
            d.drinkGrams >= 5 && d.drinkGrams <= 500 && d.settleMs >= 500 && d.settleMs <= 5000 &&
            d.reminderColor <= 0xffffffu && d.missingColor <= 0xffffffu;
   }
@@ -194,6 +202,17 @@ class BottleNvm {
     return writePeer(false, empty, false, empty);
   }
 
+  bool saveClassicPhone(const uint8_t mac[6], const char *name) {
+    if (!mac || !name) return false;
+    uint8_t any = 0, all = 255;
+    for (size_t i = 0; i < 6; ++i) { any |= mac[i]; all &= mac[i]; }
+    if (!any || all == 255) return false;
+    char safe[49] = {};
+    classicNameCopy(safe, reinterpret_cast<const uint8_t *>(name), strlen(name));
+    return writeClassic(true, mac, safe);
+  }
+  bool clearClassicPhone() { return writeClassic(false, nullptr, ""); }
+
   bool saveDnd(bool on) { BottleNvmData d = data; d.dnd = on; return saveSettings(d); }
   bool saveColor(uint8_t r, uint8_t g, uint8_t b) {
     BottleNvmData d = data; d.colorR = r; d.colorG = g; d.colorB = b; return saveSettings(d);
@@ -233,7 +252,50 @@ class BottleNvm {
  private:
   Preferences prefs_;
   bool settingsBlob_ = false, hydrationBlob_ = false, networksBlob_ = false, peerBlob_ = false;
+  bool classicBlob_ = false;
+  static const size_t kClassicBytes = 4 + 1 + 1 + 6 + 49 + 4;
+  static const uint32_t kClassicMagic = 0x31504342u;
   uint32_t legacyUsable_ = 0;
+
+  static uint32_t classicCrc(const uint8_t *b, size_t n) {
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < n; ++i) {
+      crc ^= b[i];
+      for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320u : 0);
+    }
+    return ~crc;
+  }
+  bool writeClassic(bool has, const uint8_t *mac, const char *name) {
+    uint8_t b[kClassicBytes] = {};
+    Writer w(b); w.u32(kClassicMagic); w.u8(1); w.u8(has ? 1 : 0);
+    if (has) { memcpy(b + 6, mac, 6); memcpy(b + 12, name, strlen(name)); }
+    Writer tail(b + kClassicBytes - 4); tail.u32(classicCrc(b, kClassicBytes - 4));
+    if (prefs_.putBytes("classic_v1", b, sizeof(b)) != sizeof(b)) return false;
+    data.hasClassicPhone = has;
+    memcpy(data.classicMac, b + 6, 6); memcpy(data.classicName, b + 12, 49);
+    classicBlob_ = true;
+    return true;
+  }
+  void loadClassic() {
+    // Deliberately no legacy fallback: only an explicitly selected atomic record.
+    uint8_t b[kClassicBytes];
+    if (prefs_.getBytesLength("classic_v1") != sizeof(b) ||
+        prefs_.getBytes("classic_v1", b, sizeof(b)) != sizeof(b)) return;
+    Reader r(b), tail(b + kClassicBytes - 4);
+    if (r.u32() != kClassicMagic || r.u8() != 1 || b[5] > 1 ||
+        tail.u32() != classicCrc(b, kClassicBytes - 4) || b[60] != 0) return;
+    char safe[49] = {};
+    classicNameCopy(safe, b + 12, 49);
+    if (memcmp(safe, b + 12, 49) != 0) return;
+    if (b[5]) {
+      uint8_t any = 0, all = 255;
+      for (int i = 6; i < 12; ++i) { any |= b[i]; all &= b[i]; }
+      if (!any || all == 255) return;
+      data.hasClassicPhone = true;
+      memcpy(data.classicMac, b + 6, 6); memcpy(data.classicName, b + 12, 49);
+    }
+    classicBlob_ = true;
+  }
   static const uint32_t kSettingsMagic = 0x32535442u;
   static const uint32_t kHydrationMagic = 0x32485942u;
   static const uint32_t kNetworksMagic = 0x324e5442u;
@@ -325,7 +387,7 @@ class BottleNvm {
         case 10: d.settleMs = prefs_.getUShort(key, 0); break;
         case 11: d.reminderColor = prefs_.getUInt(key, 0xffffffffu); break;
         case 12: d.missingColor = prefs_.getUInt(key, 0xffffffffu); break;
-        case 13: d.presenceEnabled = prefs_.getBool(key, false); break;
+        case 13: d.presenceEnabled = true; break; // obsolete disabled setting cannot bypass policy
       }
       if (validSettings(d)) { copySettings(data, d); legacyUsable_ |= 1UL << i; }
     }
@@ -342,9 +404,10 @@ class BottleNvm {
     d.beepType = r.u8(); d.tzMin = static_cast<int16_t>(r.u16());
     d.missingSec = r.u16(); d.beepDelaySec = r.u8(); d.drinkGrams = r.u16(); d.settleMs = r.u16();
     d.reminderColor = r.u32(); d.missingColor = r.u32();
-    const uint8_t presence = r.u8(); d.presenceEnabled = presence != 0;
+    const uint8_t presence = r.u8(); d.presenceEnabled = true; // normalize legacy false safely
     if (dnd > 1 || presence > 1 || !validSettings(d)) return false;
     copySettings(data, d); settingsBlob_ = true;
+    if (presence == 0) saveSettings(data); // best effort migration; runtime remains mandatory on write failure
     return true;
   }
   void loadHydration() {
