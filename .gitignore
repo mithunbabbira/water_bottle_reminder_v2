@@ -5,3 +5,6 @@ artifacts/
 *.elf
 .DS_Store
 __pycache__/
+
+# Unpacked macOS app staging (packages live in dist/*.dmg|*.zip)
+dist/stage/
