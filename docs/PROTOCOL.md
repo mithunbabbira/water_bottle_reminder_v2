@@ -11,7 +11,7 @@ Commands and fields:
 - `wifi.scan`: discover nearby 2.4 GHz networks asynchronously without saving or connecting; correlated ACK and result. See [scan extension](WIFI_SCAN.md).
 - `wifi.add`: ssid (1..32 UTF-8 bytes), password (empty or 8..63 bytes). SSIDs and passwords may contain spaces. Up to four networks. Does not automatically discard the oldest: report error when full. Save then start async sync.
 - `wifi.remove`: ssid.
-- `wifi.sync`: retry saved networks and NTP now. Async, BLE and scale remain responsive; Wi-Fi switches off after a bounded attempt.
+- `wifi.sync`: retry saved networks and NTP now. Async, BLE and scale remain responsive; Wi-Fi switches off after a bounded attempt. After a failed sync, firmware also auto-retries with backoff (30s→5min) while the clock remains invalid; Wi-Fi stays OFF between attempts.
 - `time.set`: epoch (UTC Unix seconds >=1700000000), optional tz_min. Manual/app-clock fallback, explicitly labelled.
 - `tare`: empty base only; explicit user confirmation in app. `calibrate`: grams (positive known reference weight). These operations may briefly sample the scale but never run from BLE callback.
 - `nvs`: send `nvs.begin`, one `nvs.entry` per key, then `nvs.end`. Every message uses same request `id`. Entry fields: key, value (JSON primitive; null if no usable value), stored (actual persistence, not default). Password values only "set"/"empty". Optional/legacy fields marked by app; unstored defaults are not faults.

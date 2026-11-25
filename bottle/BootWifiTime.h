@@ -7,6 +7,8 @@
 
 // Cooperative Wi-Fi/SNTP state machine. No network waits in setup(), loop(), or
 // a BLE callback. The app stays reachable even with a mistyped password.
+// After a failed boot/manual sync, auto-retries with backoff while the clock is
+// still invalid (Wi-Fi returns to OFF between attempts so Classic presence can run).
 class BootWifiTime {
  public:
   void begin(BottleNvm &nvm, ClockService &clock) {
@@ -17,7 +19,7 @@ class BootWifiTime {
     }
   }
 
-  bool start(const BottleNvm &nvm) {
+  bool start(const BottleNvm &nvm, bool fromAutoRetry = false) {
     if (busy()) return false;
     count_ = nvm.data.netCount;
     for (uint8_t i = 0; i < count_; ++i) nets_[i] = nvm.data.nets[i];
@@ -27,6 +29,10 @@ class BootWifiTime {
       error_ = "Add a 2.4 GHz Wi-Fi network first.";
       return false;
     }
+    if (!fromAutoRetry) {
+      autoRetries_ = 0;
+      nextRetryMs_ = kFirstRetryMs;
+    }
     index_ = 0;
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
@@ -35,8 +41,11 @@ class BootWifiTime {
     return true;
   }
 
-  void tick(ClockService &clock) {
-    if (!busy()) return;
+  void tick(ClockService &clock, BottleNvm &nvm) {
+    if (!busy()) {
+      maybeAutoRetry(clock, nvm);
+      return;
+    }
     const uint32_t now = millis();
     if (strcmp(state_, "connecting") == 0) {
       if (WiFi.status() == WL_CONNECTED) {
@@ -71,9 +80,11 @@ class BootWifiTime {
   void appTimeSet() { source_ = "app"; }
 
  private:
+  static const uint32_t kFirstRetryMs = 30000;
+  static const uint32_t kMaxRetryMs = 300000;  // 5 minutes between later attempts
   BottleNetwork nets_[BOTTLE_MAX_NETWORKS] = {};
-  uint8_t count_ = 0, index_ = 0;
-  uint32_t since_ = 0;
+  uint8_t count_ = 0, index_ = 0, autoRetries_ = 0;
+  uint32_t since_ = 0, failedAt_ = 0, nextRetryMs_ = kFirstRetryMs;
   const char *state_ = "idle";
   const char *error_ = "";
   const char *source_ = "unset";
@@ -95,5 +106,23 @@ class BootWifiTime {
     memset(nets_, 0, sizeof(nets_));
     state_ = ok ? "synced" : "failed";
     error_ = error;
+    if (ok) {
+      autoRetries_ = 0;
+      nextRetryMs_ = kFirstRetryMs;
+      return;
+    }
+    failedAt_ = millis();
+    // 30s → 60s → 120s → 240s → then every 5 minutes while the clock stays invalid.
+    if (autoRetries_ < 4) nextRetryMs_ = kFirstRetryMs << autoRetries_;
+    else nextRetryMs_ = kMaxRetryMs;
+    if (autoRetries_ < 255) ++autoRetries_;
+  }
+
+  void maybeAutoRetry(ClockService &clock, BottleNvm &nvm) {
+    if (strcmp(state_, "failed") != 0) return;
+    if (clock.valid()) return;  // app/RTC already usable — stop hammering Wi-Fi
+    if (nvm.data.netCount == 0) return;
+    if (uint32_t(millis() - failedAt_) < nextRetryMs_) return;
+    start(nvm, true);
   }
 };

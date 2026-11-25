@@ -1026,7 +1026,7 @@ class BottleBleController extends ChangeNotifier {
           ),
         );
         reportError(
-          'Wi-Fi time sync failed. $detail You can retry in Setup or use the app clock fallback.',
+          'Wi-Fi time sync failed. $detail The bottle will retry automatically; you can also retry in Setup or use the app clock fallback.',
         );
       }
       if (request?.command == 'status') {

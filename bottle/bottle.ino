@@ -394,7 +394,7 @@ void loop() {
     }
     pollSerial(); delay(1); return;
   }
-  scale.poll(nvm.data); clockSvc.tick(); wifiTime.tick(clockSvc);
+  scale.poll(nvm.data); clockSvc.tick(); wifiTime.tick(clockSvc, nvm);
   if (pendingPhone.active && pendingPhone.fromBle && (!ble.connected() || pendingPhone.session!=ble.session())) {
     pendingPhone.active=false; restoreStoredPhone();
   }
